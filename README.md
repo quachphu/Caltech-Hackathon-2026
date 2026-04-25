@@ -1,5 +1,7 @@
 # Caltech-Hackathon-2026
 
+# Nova — AI Voice Assistant for Desktop Automation
+
 Nova is a **sci-fi AI voice assistant** that lives as a transparent animated orb on your desktop. Powered by **Google Gemini**, Nova listens to your voice in real time, understands natural language, and autonomously controls your entire desktop — opening browsers, sending emails, managing your calendar, writing and running code projects, checking stocks, and much more.
 
 ---
@@ -66,6 +68,7 @@ Nova uses several Gemini models for different tasks:
 | Research paper generation            | `gemini-2.5-pro` → fallback `gemini-2.5-flash` | `main.js`       |
 | Natural language time parsing        | `gemini-2.5-flash`                             | `calendar.js`   |
 | Code generation / modification       | `gemini-2.5-flash`                             | `code_agent.js` |
+| AI video generation                  | Google Veo (`veo-2.0-generate-001`)            | `video_gen.js`  |
 
 **System identity:**  
 Gemini is given a comprehensive system prompt defining Nova as an autonomous desktop assistant. During a live session, the model can both speak back (audio response) and call desktop-control tools in the same turn.
@@ -138,6 +141,39 @@ Nova manages your calendar entirely by voice using the Google Calendar API:
 - **Check availability** — _"Am I free Thursday afternoon?"_ — Scans 8am–8pm and returns free windows.
 - **Calendar UI panel** — A glassmorphism floating panel (`calendar_panel.html`) shows today's events at a glance; voice or click to open. The panel is its own `BrowserWindow` with `nodeIntegration` and calls `ipcRenderer.invoke('calendar-get-events')` on load.
 
+#### Video Editor (`video_editor.js`)
+
+Nova integrates with **OpenShot Video Editor** for a fully hands-free video editing workflow:
+
+- **open_editor** — Kills any existing OpenShot instance, writes a minimal valid `.osp` project file (HD 720p 30fps, 5 layers, 5-minute timeline), and relaunches OpenShot with it loaded. Auto-names the project `Nova_Edit_<date>` if no name is given. On open, scans the Videos/Movies folder and reports available video files.
+- **list_projects** — Lists all `.osp` project files in the system Videos/Movies folder. Supports both exact and fuzzy name matching.
+- **import_file** — Closes OpenShot, uses `ffprobe` to extract real video metadata (resolution, FPS, duration, codecs), injects a full file entry directly into the `.osp` JSON file, then reopens OpenShot with the updated project. No import dialogs — no mouse clicks required.
+- **add_to_timeline** — Closes OpenShot, appends a complete clip entry to the `.osp` timeline (auto-positions at end of existing clips on layer 1), then reopens. Supports fuzzy file matching by name or path.
+- **delete_clip** — Sends the `Delete` key to the focused OpenShot window via `xdotool` (Linux), AppleScript (macOS), or WScript.Shell (Windows).
+- **play_preview** / **stop_preview** — Toggles playback by sending `Space` to OpenShot.
+- **save_project** — Sends `Ctrl+S` to OpenShot.
+- **export_video** — Sends `Ctrl+Shift+E` to open the Export Video dialog. Guides the user through format selection and rendering.
+- **undo** / **redo** — Sends `Ctrl+Z` / `Ctrl+Y` to OpenShot.
+- **guide** — Reports whether OpenShot is open and whether `xdotool` is available for full automation.
+- **close_editor** — Quits OpenShot, clears all session state and debounce maps.
+
+All project files are `.osp` (OpenShot JSON format) stored in the system Videos folder (`~/Movies` on macOS, `~/Videos` on Linux/Windows). Nova edits the project file directly between OpenShot sessions — no GUI interaction needed for import or timeline operations. Cross-platform keystroke delivery uses `xdotool` (Linux), `osascript` (macOS), and `PowerShell`/`WScript.Shell` (Windows). Each action has its own debounce window (3–60 seconds) to prevent Gemini from looping calls.
+
+**Video Editor Panel (`video_editor_panel.html`):** A floating glassmorphism UI panel that appears in Video Editor Mode. It lists all saved `.osp` projects, shows video files detected in the Videos folder, highlights the currently active project, and displays a live action status line. Styled with Nova's dark purple aesthetic (`rgba(6,8,18,0.97)` background, `rgba(120,80,255,0.30)` border, slide-in animation). Updates via `ipcRenderer.on('video-editor-panel-data')` IPC events.
+
+#### Video Generation (`video_gen.js`)
+
+Nova can generate original AI videos from a voice description using **Google Veo 2.0**:
+
+- **Generate** — Builds a structured prompt from up to 7 creative parameters (subject, style, setting, characters, dialogue/script, camera style, color/mood) plus quality boosters (8-second shot, 4K, cinematic composition, no jump cuts). Submits to `veo-2.0-generate-001` via `predictLongRunning`, then polls every 8 seconds for up to ~6 minutes. Downloads video bytes (base64 or URI), saves as `Nova_<slug>_<timestamp>.mp4` to the Videos folder, and auto-opens both the folder and the video player.
+- **Styles** — Six built-in style presets: `cinematic` (Hollywood depth-of-field, dramatic color grading), `animated` (3D studio rendering, fluid motion), `documentary` (naturalistic handheld, observational), `nature` (David Attenborough macro, pristine lighting), `sci-fi` (futuristic neon, otherworldly atmosphere), `commercial` (polished aspirational look).
+- **Aspect ratios** — `landscape` (16:9), `portrait` (9:16), `square` (1:1).
+- **Prompt cache** (`~/Nova/video_prompts/`) — Every generated video's prompt is saved as a JSON record (`vp_<timestamp>.json`) with title, raw prompt text, and full expanded prompt. Nova can list cached prompts, reuse them, or delete by ID.
+- **list_prompts** — Returns up to 8 recent prompts with titles, IDs, and creation dates so the user can reuse or improve previous generations.
+- **delete_prompt** — Removes a prompt record by ID from the local cache.
+
+The video generation tool has a 2-minute debounce (`VIDEO_GEN_DEBOUNCE_MS = 120000`) since generation takes 2–5 minutes. An in-flight mutex (`_videoGenInFlight`) prevents duplicate concurrent submissions.
+
 #### Code Agent (`code_agent.js`)
 
 Nova can build full coding projects from scratch entirely by voice:
@@ -173,10 +209,12 @@ Nova can build full coding projects from scratch entirely by voice:
 │  ├── Google Auth (google_auth.js — OAuth2 token management)         │
 │  ├── Gmail integration (gmail.js — send mail, contact lookup)       │
 │  ├── Calendar integration (calendar.js — CRUD + availability)       │
-│  └── Code Agent (code_agent.js — generate, modify, preview)        │
+│  ├── Code Agent (code_agent.js — generate, modify, preview)        │
+│  ├── Video Editor (video_editor.js — OpenShot .osp + keystroke)    │
+│  └── Video Generation (video_gen.js — Veo 2.0, prompt cache)       │
 │                                                                     │
 │  live.js ──── Gemini Multimodal Live WebSocket session              │
-│               └── Tool call dispatcher (8 tools, 35+ actions)     │
+│               └── Tool call dispatcher (10 tools, 50+ actions)    │
 │  gemini.js ── Gemini text chat with rolling 38-turn history         │
 │  tts.js ───── Gemini TTS (PCM → WAV, "Orus" voice profile)         │
 │  stt.js ───── Gemini batch audio transcription (WebM → text)       │
@@ -224,7 +262,7 @@ NovaAI/
 └── robot-widget/
     ├── main.js               Electron main — IPC router, all windows, automation, research paper
     ├── renderer.js           Renderer — CSS orb states, Vosk wake word, Gemini Live audio pipeline
-    ├── live.js               Gemini Live session (gemini-3.1-flash-live-preview) + 8 tool handlers
+    ├── live.js               Gemini Live session (gemini-3.1-flash-live-preview) + 10 tool handlers
     ├── gemini.js             Gemini text chat (gemini-2.5-flash, rolling 38-turn history)
     ├── tts.js                Gemini TTS (gemini-2.5-flash-preview-tts) → raw PCM → WAV file
     ├── stt.js                Gemini batch transcription — WebM buffer → text string
@@ -232,11 +270,14 @@ NovaAI/
     ├── gmail.js              Gmail API — send mail, contact name → email lookup
     ├── calendar.js           Google Calendar API — CRUD events, availability, NL time parse
     ├── code_agent.js         Code Agent — project scaffold, modify, VS Code, dev server, preview
+    ├── video_editor.js       OpenShot integration — .osp project editor + cross-platform keystrokes
+    ├── video_gen.js          Veo 2.0 video generation — prompt builder, polling, prompt cache
     ├── index.html            Main overlay window — animated orb CSS + widget markup
     ├── browser.html          Nova Browser Agent — Electron <webview> + DOM map injector
     ├── chat.html             Text "Comms" chat window markup
     ├── chat.js               Chat window renderer — sends to Gemini, plays TTS reply
     ├── calendar_panel.html   Floating calendar UI panel (glassmorphism design)
+    ├── video_editor_panel.html  Floating Video Editor Mode panel (projects + files list)
     ├── stock.html            Floating stock chart window (canvas-based chart)
     ├── package.json          Electron app config + npm scripts + dependencies
     ├── .env                  API keys (not committed — see setup below)
@@ -255,27 +296,31 @@ NovaAI/
 
 ## Features
 
-| Feature                      | Description                                                                     |
-| ---------------------------- | ------------------------------------------------------------------------------- |
-| Real-time voice conversation | Gemini Multimodal Live WebSocket — speak and get spoken replies                 |
-| Offline wake word            | Local Vosk model (English + Spanish) — no cloud round-trip for wake detection   |
-| Full browser control         | Open, navigate, scroll, smart-click, incognito toggle, close — all by voice     |
-| Store Assistant Mode         | Auto-activates on 20+ shopping sites — guides browse → select → add-to-cart     |
-| Desktop app control          | Open/close/focus any app on macOS, Windows, and Linux                           |
-| Volume & media control       | Set volume, play/pause, next/previous track                                     |
-| Shell command execution      | Run any terminal command, result returned to AI                                 |
-| Screen vision                | Screenshot → Gemini describes what's on your screen                             |
-| Gmail integration            | Send emails by voice with automatic contact name resolution                     |
-| Google Calendar              | Get, create, delete events; check free slots; natural language time parsing     |
-| Calendar UI panel            | Floating glassmorphism panel showing today's schedule                           |
-| Code Agent                   | Generate full projects (React, Python, HTML, etc.) with live preview in VS Code |
-| Stock charts                 | Real-time price + 3-month chart via Yahoo Finance (no API key needed)           |
-| Research paper generation    | Web-grounded Gemini writes an HTML paper saved to your Desktop                  |
-| Gemini TTS                   | Natural voice synthesis using the "Orus" deep sci-fi voice profile              |
-| Expressive movement          | Nova wanders organically around your screen during conversation                 |
-| Draggable overlay            | Click-drag to reposition Nova anywhere on screen                                |
-| Double-click chat            | Opens a text chat window (fallback to typed input)                              |
-| Cross-platform               | macOS, Windows, Linux (X11)                                                     |
+| Feature                      | Description                                                                                  |
+| ---------------------------- | -------------------------------------------------------------------------------------------- |
+| Real-time voice conversation | Gemini Multimodal Live WebSocket — speak and get spoken replies                              |
+| Offline wake word            | Local Vosk model (English + Spanish) — no cloud round-trip for wake detection                |
+| Full browser control         | Open, navigate, scroll, smart-click, incognito toggle, close — all by voice                  |
+| Store Assistant Mode         | Auto-activates on 20+ shopping sites — guides browse → select → add-to-cart                  |
+| Desktop app control          | Open/close/focus any app on macOS, Windows, and Linux                                        |
+| Volume & media control       | Set volume, play/pause, next/previous track                                                  |
+| Shell command execution      | Run any terminal command, result returned to AI                                              |
+| Screen vision                | Screenshot → Gemini describes what's on your screen                                          |
+| Gmail integration            | Send emails by voice with automatic contact name resolution                                  |
+| Google Calendar              | Get, create, delete events; check free slots; natural language time parsing                  |
+| Calendar UI panel            | Floating glassmorphism panel showing today's schedule                                        |
+| Code Agent                   | Generate full projects (React, Python, HTML, etc.) with live preview in VS Code              |
+| Stock charts                 | Real-time price + 3-month chart via Yahoo Finance (no API key needed)                        |
+| Research paper generation    | Web-grounded Gemini writes an HTML paper saved to your Desktop                               |
+| **AI Video Generation**      | **Google Veo 2.0 — generate 8-second 4K clips from voice descriptions with 6 style presets** |
+| **Video Editor Control**     | **Voice-control OpenShot: import files, build timelines, preview, export — no mouse needed** |
+| **Video Editor Panel**       | **Floating dark UI showing saved projects, Videos folder contents, and live action status**  |
+| **Video Prompt Cache**       | **Saves generation prompts locally for reuse, iteration, and improvement**                   |
+| Gemini TTS                   | Natural voice synthesis using the "Orus" deep sci-fi voice profile                           |
+| Expressive movement          | Nova wanders organically around your screen during conversation                              |
+| Draggable overlay            | Click-drag to reposition Nova anywhere on screen                                             |
+| Double-click chat            | Opens a text chat window (fallback to typed input)                                           |
+| Cross-platform               | macOS, Windows, Linux (X11)                                                                  |
 
 ---
 
@@ -297,6 +342,16 @@ NovaAI/
 
 - `code` CLI in PATH — VS Code must be installed and the `code` shell command available
 - `vite` — auto-installed in generated React projects via `npx`
+
+**For Video Editor (OpenShot integration):**
+
+- [OpenShot Video Editor](https://www.openshot.org/) — installed as a system app or Flatpak (`org.openshot.OpenShot`)
+- `ffprobe` (part of FFmpeg) — used to extract video metadata before import; install via `brew install ffmpeg` (macOS), `sudo apt install ffmpeg` (Linux), or download from [ffmpeg.org](https://ffmpeg.org) (Windows)
+- Linux only: `xdotool` — required for keystroke delivery (`sudo apt install xdotool` / `sudo pacman -S xdotool`)
+
+**For AI Video Generation (Veo 2.0):**
+
+- A Gemini API key with access to `veo-2.0-generate-001` (Veo 2 access may require allowlisting — check [Google AI Studio](https://aistudio.google.com/))
 
 ---
 
@@ -437,6 +492,30 @@ Chromium enforces a WebAudio autoplay policy. On first launch:
 - _"Hey Nova, write a research paper on quantum computing"_
 - _"Nova, generate an academic paper about climate change"_
 
+**Video Editor (OpenShot)**
+
+- _"Hey Nova, help me edit a video"_ → Nova creates a new project and opens OpenShot
+- _"Nova, open my project called Summer Trip"_
+- _"Hey Nova, what projects do I have?"_
+- _"Nova, import vacation.mp4"_
+- _"Hey Nova, add vacation.mp4 to the timeline"_
+- _"Nova, play the preview"_
+- _"Hey Nova, stop"_
+- _"Nova, undo that"_
+- _"Hey Nova, save the project"_
+- _"Nova, export the video"_
+- _"Hey Nova, close the video editor"_
+
+**AI Video Generation (Veo 2.0)**
+
+- _"Hey Nova, generate a cinematic video of a sunset over the ocean"_
+- _"Nova, create a sci-fi clip of a space station orbiting Earth"_
+- _"Hey Nova, make an animated video of a fox running through a forest"_
+- _"Nova, generate a documentary-style video about coral reefs with a nature aesthetic"_
+- _"Hey Nova, create a commercial video showing people enjoying coffee in a café"_
+- _"Nova, show me my saved video prompts"_
+- _"Hey Nova, regenerate the last video but make it portrait format"_
+
 **Conversation**
 
 - _"Hey Nova, what's the weather like today?"_
@@ -446,22 +525,24 @@ Chromium enforces a WebAudio autoplay policy. On first launch:
 
 ## Tech Stack
 
-| Layer                   | Technology                                                                |
-| ----------------------- | ------------------------------------------------------------------------- |
-| Desktop app shell       | Electron v41                                                              |
-| Widget UI               | CSS animations (orb states: offline, idle, listening, thinking, speaking) |
-| Offline STT / wake word | Vosk (`vosk-browser` — English + Spanish models)                          |
-| AI voice conversation   | Google Gemini Live (`@google/genai` — `gemini-3.1-flash-live-preview`)    |
-| AI text + tools         | Google Gemini Flash (`gemini-2.5-flash`)                                  |
-| Research paper AI       | Google Gemini Pro (`gemini-2.5-pro` → fallback `gemini-2.5-flash`)        |
-| Text-to-speech          | Google Gemini TTS (`gemini-2.5-flash-preview-tts`, "Orus" voice)          |
-| Gmail integration       | Google APIs (`googleapis` — Gmail v1)                                     |
-| Calendar integration    | Google APIs (`googleapis` — Calendar v3)                                  |
-| Google OAuth            | `google.auth.OAuth2` + token persistence                                  |
-| Desktop automation      | OS-native (osascript / PowerShell / xdotool / wmctrl / pactl / playerctl) |
-| Stock data              | Yahoo Finance REST API (no auth required)                                 |
-| Code generation         | Gemini 2.5 Flash — full project scaffolding in one prompt                 |
-| Live code preview       | Built-in Node.js `http.Server` (static) / Vite (React) / Express (API)    |
+| Layer                    | Technology                                                                  |
+| ------------------------ | --------------------------------------------------------------------------- |
+| Desktop app shell        | Electron v41                                                                |
+| Widget UI                | CSS animations (orb states: offline, idle, listening, thinking, speaking)   |
+| Offline STT / wake word  | Vosk (`vosk-browser` — English + Spanish models)                            |
+| AI voice conversation    | Google Gemini Live (`@google/genai` — `gemini-3.1-flash-live-preview`)      |
+| AI text + tools          | Google Gemini Flash (`gemini-2.5-flash`)                                    |
+| Research paper AI        | Google Gemini Pro (`gemini-2.5-pro` → fallback `gemini-2.5-flash`)          |
+| Text-to-speech           | Google Gemini TTS (`gemini-2.5-flash-preview-tts`, "Orus" voice)            |
+| AI video generation      | Google Veo 2.0 (`veo-2.0-generate-001` via `predictLongRunning`)            |
+| Video editor integration | OpenShot Video Editor (`.osp` JSON + `ffprobe` + cross-platform keystrokes) |
+| Gmail integration        | Google APIs (`googleapis` — Gmail v1)                                       |
+| Calendar integration     | Google APIs (`googleapis` — Calendar v3)                                    |
+| Google OAuth             | `google.auth.OAuth2` + token persistence                                    |
+| Desktop automation       | OS-native (osascript / PowerShell / xdotool / wmctrl / pactl / playerctl)   |
+| Stock data               | Yahoo Finance REST API (no auth required)                                   |
+| Code generation          | Gemini 2.5 Flash — full project scaffolding in one prompt                   |
+| Live code preview        | Built-in Node.js `http.Server` (static) / Vite (React) / Express (API)      |
 
 ---
 
@@ -715,6 +796,122 @@ All in `main.js`. Nova moves organically while in conversation, character driven
 
 ---
 
+### Phase 9 — Video Editor Integration
+
+**`video_editor.js`** — `handleVideoEditorTool(args, logFn)`
+
+The module exposes a single async handler dispatched by `live.js` via the `video_editor` tool. All state is module-level:
+
+- `_videoEditorModeActive` — whether an OpenShot session is currently live
+- `_editorOpening` — hard lock to prevent concurrent launch races
+- `_currentProjectPath` — absolute path to the active `.osp` file
+- `_veDebounce` Map — per-action timestamp debounce (3–15 second windows)
+
+**Project file format (`.osp`):**  
+`createMinimalOspProject(filePath, title)` writes a valid OpenShot JSON project:
+
+```json
+{
+  "id": "<uuid>",
+  "fps": { "num": 24, "den": 1 },
+  "width": 1280,
+  "height": 720,
+  "sample_rate": 48000,
+  "channels": 2,
+  "layers": [{ "id": "L1", "number": 1000000 }, "..."],
+  "clips": [],
+  "files": [],
+  "effects": [],
+  "markers": []
+}
+```
+
+The `version` field is set to `"0.0.0"` placeholders — OpenShot overwrites on save, avoiding version-mismatch warnings.
+
+**`import_file` flow (no GUI required):**
+
+1. Kill OpenShot → `killOpenShot()` (platform-specific: `osascript quit`, `flatpak kill`, or `taskkill`)
+2. Run `ffprobe` on the video → parse JSON → extract width, height, duration, FPS, codecs
+3. Build a complete `fileEntry` object (UUID, media type, frames count, `reader.path`, etc.)
+4. Read `.osp` → remove any existing entry for that path → push new entry → write back
+5. Relaunch OpenShot with the `.osp` path argument → returns immediately
+
+**`add_to_timeline` flow:**
+
+1. Kill OpenShot
+2. Read `.osp` → fuzzy-match file entry by name/path → find `lastEnd` of layer 1000000 clips
+3. Build `clipEntry` with full keyframe structure (`alpha`, `location_x/y`, `rotation`, `scale_x/y`, `volume`, `time` — all as single-point keyframes at `(1, 1)` or `(1, 0)`)
+4. Push clip → write `.osp` → relaunch OpenShot
+
+**Keystroke delivery** (`sendKey(key)` / `typeText(text)`):
+
+- Linux: `xdotool search --onlyvisible --name "OpenShot"` → `xdotool key --window $WID --clearmodifiers <key>`
+- macOS: `osascript -e 'tell application "System Events" to keystroke "<key>" using {<mods>}'`
+- Windows: `WScript.Shell.SendKeys()` via PowerShell, with key format translation (`ctrl→^`, `shift→+`, etc.)
+
+`sendKeyToActive()` / `typeTextToActive()` — alternate versions that skip `focusOpenShot()`, targeting the currently focused window (e.g. an open file dialog on Linux).
+
+**`main.js` IPC additions:**
+
+- `ipcMain.handle('video-editor-panel-data')` — responds with `{ projects, videos, currentProject }` for the panel UI
+- On `video_editor` tool call → `handleVideoEditorTool(args, logFn)` → sends `video-editor-panel-status` IPC to update the floating panel
+
+**`video_editor_panel.html`** — standalone `BrowserWindow`:
+
+- `transparent: true`, `frame: false`, `alwaysOnTop: true`
+- `ipcRenderer.on('video-editor-panel-data', (_, data))` → calls `renderList()` for projects and videos
+- `ipcRenderer.on('video-editor-panel-status', (_, status))` → updates action status text
+- Projects in the active session are highlighted with a purple border (`rgba(120,80,255,0.40)`)
+
+---
+
+### Phase 10 — AI Video Generation
+
+**`video_gen.js`** — `handleVideoGenerationTool(args, logFn)`
+
+**Prompt construction** (`buildVideoPrompt(params)`):
+Assembles a structured English prompt from 7 fields plus fixed quality boosters:
+
+```
+<STYLE_PREFIX> <subject> Setting: <setting>. Characters: <characters>.
+Scene and dialogue: <dialogue_script>. Camera: <camera_style>.
+Color and mood: <mood_color>.
+8-second continuous shot, smooth motion throughout, coherent narrative arc,
+4K ultra-high definition, professional audio if speech is present,
+cinematic composition, no jump cuts, visually compelling framing.
+```
+
+The `STYLE_PREFIXES` map translates the 6 named styles into quality descriptors that consistently improve Veo output.
+
+**Veo API call** (`callVeoAPI({ fullPrompt, aspectRatio }, apiKey, logFn)`):
+
+1. POST to `https://generativelanguage.googleapis.com/v1beta/models/veo-2.0-generate-001:predictLongRunning?key=<key>`
+   - Body: `{ instances: [{ prompt }], parameters: { aspectRatio, durationSeconds: 8, enhancePrompt: true, personGeneration: 'allow_adult' } }`
+2. Extract `opData.name` (long-running operation name)
+3. Poll `GET .../v1beta/<opName>?key=<key>` every 8 seconds, up to 45 attempts (~6 minutes)
+4. On `done: true` → extract `generateVideoResponse.generatedSamples[0].video`
+5. Return video bytes from `bytesBase64Encoded` or by downloading from `uri`
+
+**Saving and opening:**
+
+- File saved as `Nova_<slug>_<ISO-timestamp>.mp4` in `~/Movies` (macOS) or `~/Videos` (Linux/Windows)
+- `openFolderThenVideo()`: opens the containing folder first (`xdg-open` / `open` / `explorer`), then opens the video in the preferred player (`mpv` → `vlc` → `xdg-open` on Linux; `open` on macOS; `start` on Windows)
+
+**Prompt cache** (`~/Nova/video_prompts/`):
+
+- Each generated video saves a JSON record: `{ id, title, prompt_text, full_prompt, created }`
+- `listCachedPrompts()` — reads all `.json` files, sorts by creation date descending
+- `deletePromptFromCache(id)` — removes the file by ID
+
+**`live.js` integration:**
+
+- Tool name: `video_generation`, actions: `generate`, `list_prompts`, `delete_prompt`
+- `_videoGenInFlight` mutex prevents parallel Veo submissions
+- `_lastVideoGenAt` + `VIDEO_GEN_DEBOUNCE_MS = 120000` blocks re-triggering during generation
+- After generation completes: `_videoGenInFlight = false`, `_lastVideoGenAt = Date.now()`
+
+---
+
 ### Common Gotchas
 
 - **Wayland breaks transparency.** Always set `ELECTRON_OZONE_PLATFORM_HINT=x11` on Linux before `app.ready`. Do this at the very top of `main.js` before any `require`.
@@ -726,3 +923,10 @@ All in `main.js`. Nova moves organically while in conversation, character driven
 - **Code Agent project types** must be one of the 7 known values: `static_website`, `react`, `api_only`, `fullstack`, `cli`, `extension`, `python`. The generation prompt is deeply specialized per type — other values produce generic output.
 - **`browser.html` DOM map** is injected via `webview.executeJavaScript()`. The webview must be fully loaded (`did-stop-loading` or `dom-ready`) before injecting. Always add a 500 ms debounce on `url-changed` events before triggering DOM extraction to avoid reading mid-navigation DOM.
 - **`global.novaIsResearching` flag** in `main.js` must be checked AND set before the async research pipeline runs. If you rebuild this, check the flag before starting, set it immediately, and clear it in both the `finally` block and after the 10-minute cooldown expires.
+- **OpenShot must be fully quit before editing `.osp` files.** If OpenShot is open when Nova writes to the `.osp`, OpenShot will overwrite it with the old version on exit. `killOpenShot()` must complete (with a 500 ms settle) before any `writeOsp()` call.
+- **`ffprobe` is required for clean imports.** Without it, `getVideoMetadata()` returns fallback values (1280×720, 30s, 24fps), which still works but may show incorrect clip lengths in OpenShot. Install FFmpeg to enable real metadata extraction.
+- **OpenShot `.osp` clip keyframe structure is strict.** Every keyframe curve must use the exact `{ co: { X, Y }, interpolation: 2 }` object format. A missing or malformed curve causes libopenshot to crash the render. Always use `buildClipEntry()` — never write clip JSON by hand.
+- **Veo 2.0 generation takes 2–5 minutes.** The 2-minute `VIDEO_GEN_DEBOUNCE_MS` is intentional — if Gemini Live retries the tool call while generation is in-flight, the mutex (`_videoGenInFlight`) will block it. Never remove the mutex or debounce.
+- **Veo aspect ratio strings must be `'16:9'`, `'9:16'`, or `'1:1'`** — not the human-readable words. `video_gen.js` maps `landscape/portrait/square` to these internally via `aspectMap`.
+- **Video Editor Mode panel window** must be created as a separate `BrowserWindow` with `nodeIntegration: true` to receive IPC events. If you rebuild the panel, set `webPreferences: { nodeIntegration: true, contextIsolation: false }` — otherwise `require('electron')` will fail in the panel renderer.
+- **xdotool window search is fragile on Linux.** The module tries both `--name "OpenShot"` and `--class "openshot"` variants. If neither matches (e.g. Flatpak uses a different window title), keystrokes silently do nothing. Always surface the `needs_xdotool` / `guide` action so the user knows automation requires xdotool.
