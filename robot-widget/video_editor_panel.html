@@ -1,0 +1,168 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <title>Nova Video Editor</title>
+  <style>
+    *, *::before, *::after { margin: 0; padding: 0; box-sizing: border-box; }
+    html, body {
+      width: 100%; height: 100%;
+      overflow: hidden;
+      background: transparent;
+      user-select: none; -webkit-user-select: none;
+    }
+    #panel {
+      width: 100%; height: 100%;
+      background: rgba(6, 8, 18, 0.97);
+      border: 1px solid rgba(120, 80, 255, 0.30);
+      border-radius: 16px;
+      padding: 14px 16px 12px;
+      box-shadow: 0 12px 48px rgba(0,0,0,0.85), 0 0 32px rgba(120,80,255,0.08);
+      backdrop-filter: blur(24px); -webkit-backdrop-filter: blur(24px);
+      font-family: 'Segoe UI', system-ui, sans-serif;
+      font-size: 12px; color: #ccd6f0;
+      display: flex; flex-direction: column; gap: 10px;
+      animation: slideIn 0.22s cubic-bezier(0.22,1,0.36,1);
+      -webkit-app-region: drag;
+    }
+    @keyframes slideIn {
+      from { opacity: 0; transform: translateY(10px) scale(0.97); }
+      to   { opacity: 1; transform: translateY(0) scale(1); }
+    }
+    #header {
+      display: flex; align-items: center; gap: 8px;
+      border-bottom: 1px solid rgba(120,80,255,0.18);
+      padding-bottom: 8px;
+    }
+    #header-icon { font-size: 18px; }
+    #header-title { font-size: 13px; font-weight: 600; color: #a89bff; flex: 1; }
+    #status-dot {
+      width: 8px; height: 8px; border-radius: 50%;
+      background: #4ade80; box-shadow: 0 0 6px #4ade80;
+      animation: pulse 2s infinite;
+    }
+    @keyframes pulse {
+      0%, 100% { opacity: 1; } 50% { opacity: 0.4; }
+    }
+    .section-title {
+      font-size: 10px; font-weight: 600; letter-spacing: 0.08em;
+      color: rgba(168,155,255,0.7); text-transform: uppercase; margin-bottom: 4px;
+    }
+    .item-list { display: flex; flex-direction: column; gap: 3px; }
+    .item {
+      display: flex; align-items: center; gap: 8px;
+      padding: 5px 8px; border-radius: 8px;
+      background: rgba(255,255,255,0.04);
+      border: 1px solid rgba(255,255,255,0.06);
+      cursor: default; -webkit-app-region: no-drag;
+      transition: background 0.15s;
+    }
+    .item:hover { background: rgba(120,80,255,0.12); border-color: rgba(120,80,255,0.25); }
+    .item.active {
+      background: rgba(120,80,255,0.18);
+      border-color: rgba(120,80,255,0.40);
+    }
+    .item-num {
+      font-size: 10px; font-weight: 700;
+      color: #a89bff; min-width: 16px; text-align: center;
+    }
+    .item-name { flex: 1; color: #dde8f0; font-size: 11px; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+    .item-type { font-size: 9px; color: rgba(255,255,255,0.35); }
+    #current-project {
+      background: rgba(120,80,255,0.12);
+      border: 1px solid rgba(120,80,255,0.35);
+      border-radius: 8px; padding: 6px 10px;
+      font-size: 11px; color: #c4b8ff;
+      display: flex; align-items: center; gap: 6px;
+    }
+    #current-project-icon { font-size: 14px; }
+    #action-status {
+      font-size: 10px; color: rgba(100,220,160,0.8);
+      padding: 3px 0; text-align: center;
+      min-height: 14px;
+    }
+    #tip {
+      font-size: 10px; color: rgba(255,255,255,0.25);
+      text-align: center; padding-top: 2px;
+    }
+    .empty-msg { color: rgba(255,255,255,0.25); font-size: 11px; text-align: center; padding: 6px 0; }
+  </style>
+</head>
+<body>
+  <div id="panel">
+    <div id="header">
+      <span id="header-icon">🎬</span>
+      <span id="header-title">Video Editor Mode</span>
+      <div id="status-dot"></div>
+    </div>
+
+    <div id="current-project" style="display:none">
+      <span id="current-project-icon">📁</span>
+      <span id="current-project-name">No project open</span>
+    </div>
+
+    <div>
+      <div class="section-title">Saved Projects</div>
+      <div class="item-list" id="projects-list">
+        <div class="empty-msg">No projects found</div>
+      </div>
+    </div>
+
+    <div>
+      <div class="section-title">Videos in Folder</div>
+      <div class="item-list" id="videos-list">
+        <div class="empty-msg">No videos found</div>
+      </div>
+    </div>
+
+    <div id="action-status"></div>
+    <div id="tip">Say the number to import a video</div>
+  </div>
+
+  <script>
+    const { ipcRenderer } = require('electron');
+
+    function renderList(containerId, items, type) {
+      const el = document.getElementById(containerId);
+      if (!items || items.length === 0) {
+        el.innerHTML = '<div class="empty-msg">None found</div>';
+        return;
+      }
+      el.innerHTML = items.map((name, i) => `
+        <div class="item" title="${name}">
+          <span class="item-num">${i + 1}</span>
+          <span class="item-name">${name}</span>
+          <span class="item-type">${type}</span>
+        </div>
+      `).join('');
+    }
+
+    ipcRenderer.on('video-editor-panel-data', (_, data) => {
+      if (data.projects) renderList('projects-list', data.projects, '.osp');
+      if (data.videos)   renderList('videos-list',   data.videos,   'video');
+
+      const cp = document.getElementById('current-project');
+      const cpName = document.getElementById('current-project-name');
+      if (data.currentProject) {
+        cp.style.display = 'flex';
+        cpName.textContent = data.currentProject;
+        // Highlight matching project
+        document.querySelectorAll('#projects-list .item').forEach((el, i) => {
+          if ((data.projects || [])[i] === data.currentProject) el.classList.add('active');
+          else el.classList.remove('active');
+        });
+      } else {
+        cp.style.display = 'none';
+      }
+
+      if (data.status) {
+        document.getElementById('action-status').textContent = data.status;
+      }
+    });
+
+    ipcRenderer.on('video-editor-panel-status', (_, status) => {
+      document.getElementById('action-status').textContent = status;
+    });
+  </script>
+</body>
+</html>

@@ -1,0 +1,413 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <title>Nova Calendar</title>
+  <style>
+    *, *::before, *::after { margin: 0; padding: 0; box-sizing: border-box; }
+
+    html, body {
+      width: 100%;
+      height: 100%;
+      overflow: hidden;
+      background: transparent;
+      user-select: none;
+      -webkit-user-select: none;
+    }
+
+    #panel {
+      width: 100%;
+      height: 100%;
+      background: rgba(8, 12, 22, 0.93);
+      border: 1px solid rgba(0, 255, 200, 0.22);
+      border-radius: 16px;
+      padding: 14px 16px 12px;
+      box-shadow: 0 12px 40px rgba(0,0,0,0.7), 0 0 24px rgba(0,255,200,0.06);
+      backdrop-filter: blur(20px);
+      -webkit-backdrop-filter: blur(20px);
+      font-family: 'Segoe UI', system-ui, sans-serif;
+      font-size: 12px;
+      color: #e0e8f0;
+      display: flex;
+      flex-direction: column;
+      animation: fadeIn 0.22s ease;
+      -webkit-app-region: drag;
+    }
+
+    @keyframes fadeIn {
+      from { opacity: 0; transform: translateY(10px) scale(0.97); }
+      to   { opacity: 1; transform: translateY(0) scale(1); }
+    }
+
+    /* ── Header ── */
+    #cal-header {
+      display: flex;
+      justify-content: space-between;
+      align-items: center;
+      margin-bottom: 10px;
+      -webkit-app-region: drag;
+    }
+    #cal-title {
+      font-size: 13px;
+      font-weight: 700;
+      color: #00ffc8;
+      letter-spacing: 0.4px;
+    }
+    #cal-close-btn {
+      background: none;
+      border: none;
+      color: rgba(255,255,255,0.35);
+      font-size: 14px;
+      cursor: pointer;
+      padding: 2px 4px;
+      border-radius: 4px;
+      line-height: 1;
+      -webkit-app-region: no-drag;
+      transition: color 0.15s, background 0.15s;
+    }
+    #cal-close-btn:hover {
+      color: rgba(255,255,255,0.85);
+      background: rgba(255,255,255,0.08);
+    }
+
+    /* ── Week strip ── */
+    #cal-week-label {
+      font-size: 10px;
+      color: rgba(0,255,200,0.55);
+      font-weight: 600;
+      text-transform: uppercase;
+      letter-spacing: 0.5px;
+      text-align: center;
+      margin-bottom: 6px;
+    }
+    #cal-week-strip {
+      display: grid;
+      grid-template-columns: repeat(7, 1fr);
+      gap: 4px;
+      margin-bottom: 10px;
+    }
+    .week-day-cell {
+      display: flex;
+      flex-direction: column;
+      align-items: center;
+      gap: 2px;
+      padding: 6px 2px;
+      border-radius: 8px;
+      cursor: default;
+      transition: background 0.12s;
+    }
+    .week-day-cell.today {
+      background: rgba(0,255,200,0.14);
+    }
+    .week-day-cell.has-event {
+      background: rgba(0,255,200,0.07);
+    }
+    .week-day-cell.today.has-event {
+      background: rgba(0,255,200,0.20);
+    }
+    .week-day-name {
+      font-size: 9px;
+      font-weight: 700;
+      color: rgba(0,255,200,0.45);
+      text-transform: uppercase;
+      letter-spacing: 0.4px;
+    }
+    .week-day-cell.today .week-day-name {
+      color: rgba(0,255,200,0.85);
+    }
+    .week-day-num {
+      font-size: 13px;
+      font-weight: 600;
+      color: rgba(255,255,255,0.45);
+      line-height: 1;
+    }
+    .week-day-cell.today .week-day-num {
+      color: #00ffc8;
+    }
+    .week-day-dot {
+      width: 4px;
+      height: 4px;
+      border-radius: 50%;
+      background: #00ffc8;
+      opacity: 0;
+      box-shadow: 0 0 4px rgba(0,255,200,0.7);
+    }
+    .week-day-cell.has-event .week-day-dot {
+      opacity: 0.85;
+    }
+    .week-day-cell.today .week-day-dot {
+      opacity: 1;
+    }
+
+    /* ── Events List ── */
+    #cal-divider {
+      border: none;
+      border-top: 1px solid rgba(255,255,255,0.07);
+      margin-bottom: 8px;
+    }
+    #cal-events-label {
+      font-size: 10px;
+      color: rgba(0,255,200,0.5);
+      font-weight: 700;
+      text-transform: uppercase;
+      letter-spacing: 0.6px;
+      margin-bottom: 6px;
+    }
+    #cal-events-list {
+      flex: 1;
+      overflow-y: auto;
+      min-height: 0;
+      padding-right: 2px;
+    }
+    #cal-events-list::-webkit-scrollbar { width: 3px; }
+    #cal-events-list::-webkit-scrollbar-track { background: transparent; }
+    #cal-events-list::-webkit-scrollbar-thumb {
+      background: rgba(0,255,200,0.25);
+      border-radius: 2px;
+    }
+
+    .cal-event-item {
+      display: flex;
+      align-items: flex-start;
+      gap: 8px;
+      padding: 6px 4px;
+      border-radius: 8px;
+      margin-bottom: 2px;
+      transition: background 0.12s;
+    }
+    .cal-event-item:hover { background: rgba(255,255,255,0.04); }
+    .cal-event-dot {
+      width: 7px;
+      height: 7px;
+      border-radius: 50%;
+      background: #00ffc8;
+      margin-top: 3px;
+      flex-shrink: 0;
+      box-shadow: 0 0 5px rgba(0,255,200,0.5);
+    }
+    .cal-event-info { flex: 1; min-width: 0; }
+    .cal-event-title {
+      font-size: 12px;
+      font-weight: 500;
+      color: #e8f0f8;
+      white-space: nowrap;
+      overflow: hidden;
+      text-overflow: ellipsis;
+    }
+    .cal-event-time {
+      font-size: 10px;
+      color: rgba(0,255,200,0.55);
+      margin-top: 2px;
+    }
+    /* Day badge shows which day the event is on */
+    .cal-event-day-badge {
+      font-size: 9px;
+      font-weight: 700;
+      color: rgba(0,255,200,0.70);
+      background: rgba(0,255,200,0.08);
+      border: 1px solid rgba(0,255,200,0.18);
+      border-radius: 4px;
+      padding: 1px 5px;
+      flex-shrink: 0;
+      margin-top: 2px;
+      text-transform: uppercase;
+      letter-spacing: 0.4px;
+    }
+    #cal-no-events {
+      text-align: center;
+      color: rgba(255,255,255,0.3);
+      font-size: 11px;
+      padding: 16px 0;
+      font-style: italic;
+    }
+
+    /* ── Footer ── */
+    #cal-footer {
+      margin-top: 8px;
+      padding-top: 8px;
+      border-top: 1px solid rgba(255,255,255,0.05);
+      font-size: 9px;
+      color: rgba(255,255,255,0.2);
+      text-align: center;
+      letter-spacing: 0.3px;
+    }
+  </style>
+</head>
+<body>
+  <div id="panel">
+    <div id="cal-header">
+      <span id="cal-title">📅 Calendar</span>
+      <button id="cal-close-btn" title="Close">✕</button>
+    </div>
+
+    <div id="cal-week-label">This Week</div>
+    <div id="cal-week-strip"></div>
+
+    <hr id="cal-divider" />
+    <div id="cal-events-label">Events</div>
+    <div id="cal-events-list">
+      <div id="cal-no-events">No events</div>
+    </div>
+
+    <div id="cal-footer">Nova AI · Google Calendar</div>
+  </div>
+
+  <script>
+    const { ipcRenderer } = require('electron');
+
+    const weekLabel  = document.getElementById('cal-week-label');
+    const weekStrip  = document.getElementById('cal-week-strip');
+    const eventsList = document.getElementById('cal-events-list');
+    const noEvents   = document.getElementById('cal-no-events');
+    const closeBtn   = document.getElementById('cal-close-btn');
+    const calTitle   = document.getElementById('cal-title');
+
+    const DAY_NAMES_SHORT  = ['Sun','Mon','Tue','Wed','Thu','Fri','Sat'];
+    const DAY_NAMES_LONG   = ['Sunday','Monday','Tuesday','Wednesday','Thursday','Friday','Saturday'];
+    const MONTH_NAMES = ['January','February','March','April','May','June',
+                         'July','August','September','October','November','December'];
+
+    closeBtn.addEventListener('click', () => {
+      ipcRenderer.send('calendar-panel-hide');
+    });
+
+    ipcRenderer.on('calendar-data', (event, { action, events, timeExpression }) => {
+      const label = timeExpression || 'this week';
+      calTitle.textContent = '📅 ' + label.charAt(0).toUpperCase() + label.slice(1);
+
+      renderWeekStrip(events || []);
+      renderEvents(events || [], timeExpression);
+    });
+
+    /**
+     * Render the 7-day week strip for the current week.
+     * Each cell shows: day name, date number, dot if events that day.
+     */
+    function renderWeekStrip(events) {
+      weekStrip.innerHTML = '';
+
+      const today    = new Date();
+      const todayNum = today.getDate();
+      const tz       = Intl.DateTimeFormat().resolvedOptions().timeZone;
+
+      // Build set of dates (YYYY-MM-DD) that have events
+      const eventDates = new Set();
+      for (const ev of events) {
+        if (!ev.start) continue;
+        const d = new Date(ev.start);
+        // Format as local YYYY-MM-DD
+        const key = d.toLocaleDateString('en-CA', { timeZone: tz }); // 'en-CA' gives YYYY-MM-DD
+        eventDates.add(key);
+      }
+
+      // Find the Monday of the current week (or Sunday if preferred)
+      // Use Sunday-start week to match US calendars
+      const weekStart = new Date(today);
+      weekStart.setDate(today.getDate() - today.getDay()); // Go back to Sunday
+      weekStart.setHours(0, 0, 0, 0);
+
+      // Update week label with date range
+      const weekEnd = new Date(weekStart);
+      weekEnd.setDate(weekStart.getDate() + 6);
+      const startStr = weekStart.toLocaleDateString('en-US', { month: 'short', day: 'numeric', timeZone: tz });
+      const endStr   = weekEnd.toLocaleDateString('en-US', { month: 'short', day: 'numeric', timeZone: tz });
+      weekLabel.textContent = startStr + ' – ' + endStr;
+
+      for (let i = 0; i < 7; i++) {
+        const day    = new Date(weekStart);
+        day.setDate(weekStart.getDate() + i);
+
+        const dayKey   = day.toLocaleDateString('en-CA', { timeZone: tz });
+        const isToday  = day.toDateString() === today.toDateString();
+        const hasEvent = eventDates.has(dayKey);
+
+        const cell = document.createElement('div');
+        cell.className = 'week-day-cell' +
+                         (isToday  ? ' today'     : '') +
+                         (hasEvent ? ' has-event' : '');
+
+        const nameEl = document.createElement('div');
+        nameEl.className = 'week-day-name';
+        nameEl.textContent = DAY_NAMES_SHORT[day.getDay()];
+
+        const numEl = document.createElement('div');
+        numEl.className = 'week-day-num';
+        numEl.textContent = day.getDate();
+
+        const dotEl = document.createElement('div');
+        dotEl.className = 'week-day-dot';
+
+        cell.appendChild(nameEl);
+        cell.appendChild(numEl);
+        cell.appendChild(dotEl);
+        weekStrip.appendChild(cell);
+      }
+    }
+
+    function renderEvents(events, timeExpression) {
+      eventsList.querySelectorAll('.cal-event-item').forEach(el => el.remove());
+
+      if (!events || events.length === 0) {
+        noEvents.style.display = 'block';
+        return;
+      }
+      noEvents.style.display = 'none';
+
+      const tz = Intl.DateTimeFormat().resolvedOptions().timeZone;
+
+      events.slice(0, 10).forEach(ev => {
+        const item = document.createElement('div');
+        item.className = 'cal-event-item';
+
+        const dot = document.createElement('div');
+        dot.className = 'cal-event-dot';
+
+        const info = document.createElement('div');
+        info.className = 'cal-event-info';
+
+        const title = document.createElement('div');
+        title.className = 'cal-event-title';
+        title.textContent = ev.title || 'Untitled Event';
+
+        const time = document.createElement('div');
+        time.className = 'cal-event-time';
+
+        let dayBadgeText = '';
+        if (ev.allDay) {
+          time.textContent = 'All day';
+          if (ev.start) {
+            const d = new Date(ev.start);
+            dayBadgeText = DAY_NAMES_SHORT[d.getDay()] + ' ' + d.getDate();
+          }
+        } else if (ev.start) {
+          try {
+            const d       = new Date(ev.start);
+            const timeStr = d.toLocaleTimeString('en-US', { hour: 'numeric', minute: '2-digit', hour12: true, timeZone: tz });
+            time.textContent = timeStr;
+            // Day badge: "Mon 14" style
+            dayBadgeText = DAY_NAMES_SHORT[d.getDay()] + ' ' +
+                           d.toLocaleDateString('en-US', { day: 'numeric', timeZone: tz });
+          } catch (_) {
+            time.textContent = ev.start;
+          }
+        }
+
+        info.appendChild(title);
+        info.appendChild(time);
+        item.appendChild(dot);
+        item.appendChild(info);
+
+        // Day badge on the right
+        if (dayBadgeText) {
+          const badge = document.createElement('div');
+          badge.className = 'cal-event-day-badge';
+          badge.textContent = dayBadgeText;
+          item.appendChild(badge);
+        }
+
+        eventsList.appendChild(item);
+      });
+    }
+  </script>
+</body>
+</html>

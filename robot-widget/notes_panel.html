@@ -1,0 +1,388 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <title>Nova Notes</title>
+  <style>
+    *, *::before, *::after { margin: 0; padding: 0; box-sizing: border-box; }
+
+    html, body {
+      width: 100%; height: 100%;
+      overflow: hidden;
+      background: transparent;
+      user-select: none; -webkit-user-select: none;
+    }
+
+    #panel {
+      width: 100%; height: 100%;
+      background: rgba(6, 10, 20, 0.96);
+      border: 1px solid rgba(0, 255, 200, 0.22);
+      border-radius: 16px;
+      padding: 16px 18px 14px;
+      box-shadow: 0 12px 48px rgba(0,0,0,0.8), 0 0 32px rgba(0,255,200,0.06);
+      backdrop-filter: blur(24px); -webkit-backdrop-filter: blur(24px);
+      font-family: 'Segoe UI', system-ui, sans-serif;
+      font-size: 13px; color: #dde8f0;
+      display: flex; flex-direction: column;
+      animation: slideIn 0.22s cubic-bezier(0.22,1,0.36,1);
+      -webkit-app-region: drag;
+    }
+
+    @keyframes slideIn {
+      from { opacity: 0; transform: translateY(12px) scale(0.96); }
+      to   { opacity: 1; transform: translateY(0) scale(1); }
+    }
+
+    /* ── Header ── */
+    #panel-header {
+      display: flex; align-items: center; gap: 8px;
+      margin-bottom: 10px; -webkit-app-region: drag;
+    }
+    #back-btn {
+      background: none; border: none;
+      color: rgba(0,255,200,0.6); font-size: 14px;
+      cursor: pointer; padding: 2px 6px; border-radius: 4px;
+      -webkit-app-region: no-drag;
+      transition: color 0.15s, background 0.15s;
+      display: none;
+    }
+    #back-btn:hover { color: #00ffc8; background: rgba(0,255,200,0.08); }
+    #panel-title {
+      flex: 1; font-size: 13px; font-weight: 700;
+      color: #00ffc8; letter-spacing: 0.4px;
+    }
+    #close-btn {
+      background: none; border: none;
+      color: rgba(255,255,255,0.3); font-size: 14px;
+      cursor: pointer; padding: 2px 4px; border-radius: 4px;
+      -webkit-app-region: no-drag;
+      transition: color 0.15s, background 0.15s;
+    }
+    #close-btn:hover { color: rgba(255,255,255,0.8); background: rgba(255,255,255,0.07); }
+
+    /* ── Status bar ── */
+    #status-bar {
+      display: none;
+      align-items: center; gap: 8px;
+      background: rgba(0,255,200,0.06);
+      border: 1px solid rgba(0,255,200,0.15);
+      border-radius: 8px; padding: 7px 10px;
+      margin-bottom: 10px;
+      font-size: 11px; color: rgba(0,255,200,0.85);
+    }
+    #status-bar.visible { display: flex; }
+    .pulse-dot {
+      width: 7px; height: 7px; border-radius: 50%;
+      background: #00ffc8; flex-shrink: 0;
+      box-shadow: 0 0 6px rgba(0,255,200,0.8);
+      animation: pulse 1.2s ease-in-out infinite;
+    }
+    @keyframes pulse {
+      0%,100% { opacity: 1; transform: scale(1); }
+      50%      { opacity: 0.4; transform: scale(0.7); }
+    }
+
+    /* ── List view ── */
+    #list-view { flex: 1; display: flex; flex-direction: column; overflow: hidden; }
+    #search-hint {
+      font-size: 10px; color: rgba(0,255,200,0.4);
+      font-style: italic; margin-bottom: 6px;
+      padding: 0 2px;
+    }
+    #notes-list {
+      flex: 1; overflow-y: auto; min-height: 0;
+      padding-right: 2px;
+    }
+    #notes-list::-webkit-scrollbar { width: 3px; }
+    #notes-list::-webkit-scrollbar-track { background: transparent; }
+    #notes-list::-webkit-scrollbar-thumb { background: rgba(0,255,200,0.2); border-radius: 2px; }
+
+    .note-card {
+      padding: 9px 10px; border-radius: 10px; margin-bottom: 5px;
+      border: 1px solid rgba(0,255,200,0.1);
+      background: rgba(0,255,200,0.03);
+      cursor: pointer; transition: background 0.12s, border-color 0.12s;
+      -webkit-app-region: no-drag;
+    }
+    .note-card:hover {
+      background: rgba(0,255,200,0.07);
+      border-color: rgba(0,255,200,0.22);
+    }
+    .note-card-title {
+      font-size: 13px; font-weight: 600;
+      color: #c8e8f8; margin-bottom: 4px;
+      white-space: nowrap; overflow: hidden; text-overflow: ellipsis;
+    }
+    .note-card-preview {
+      font-size: 11px; color: rgba(200,220,240,0.5);
+      line-height: 1.5; display: -webkit-box;
+      -webkit-line-clamp: 2; -webkit-box-orient: vertical; overflow: hidden;
+    }
+    .note-card-date {
+      font-size: 10px; color: rgba(0,255,200,0.38);
+      margin-top: 5px; letter-spacing: 0.2px;
+    }
+
+    #no-notes {
+      text-align: center; color: rgba(255,255,255,0.25);
+      font-size: 11px; padding: 24px 0; font-style: italic;
+    }
+
+    /* ── Note view ── */
+    #note-view {
+      flex: 1; display: none; flex-direction: column; overflow: hidden;
+    }
+    #note-content-title {
+      font-size: 15px; font-weight: 700; color: #00ffc8;
+      margin-bottom: 10px; padding-bottom: 10px;
+      border-bottom: 1px solid rgba(0,255,200,0.15);
+      white-space: nowrap; overflow: hidden; text-overflow: ellipsis;
+    }
+    #note-content-body {
+      flex: 1; overflow-y: auto; min-height: 0;
+      padding-right: 6px; font-size: 13px;
+      line-height: 1.7; color: rgba(215,235,248,0.92);
+    }
+    #note-content-body::-webkit-scrollbar { width: 3px; }
+    #note-content-body::-webkit-scrollbar-track { background: transparent; }
+    #note-content-body::-webkit-scrollbar-thumb { background: rgba(0,255,200,0.2); border-radius: 2px; }
+
+    /* Markdown-rendered styles */
+    #note-content-body h1 { display: none; } /* Title shown in header */
+    #note-content-body h2 {
+      font-size: 12px; font-weight: 700; color: #00ffc8;
+      text-transform: uppercase; letter-spacing: 0.7px;
+      margin: 14px 0 5px;
+    }
+    #note-content-body h3 {
+      font-size: 12px; font-weight: 600; color: rgba(0,255,200,0.75);
+      margin: 10px 0 4px;
+    }
+    #note-content-body p { margin-bottom: 8px; }
+    #note-content-body ul, #note-content-body ol {
+      padding-left: 16px; margin-bottom: 8px;
+    }
+    #note-content-body li { margin-bottom: 4px; }
+    #note-content-body strong { color: #e8f4ff; font-weight: 600; }
+    #note-content-body em { color: rgba(210,230,245,0.72); font-style: italic; }
+    #note-content-body code {
+      font-family: 'Courier New', monospace; font-size: 12px;
+      background: rgba(0,255,200,0.09); padding: 2px 5px;
+      border-radius: 3px; color: #a8ffdc;
+    }
+    #note-content-body pre {
+      background: rgba(0,0,0,0.35); border: 1px solid rgba(0,255,200,0.12);
+      border-radius: 7px; padding: 10px 12px; margin-bottom: 8px;
+      overflow-x: auto;
+    }
+    #note-content-body pre code {
+      background: none; padding: 0; font-size: 11.5px;
+    }
+    #note-content-body hr {
+      border: none; border-top: 1px solid rgba(0,255,200,0.1);
+      margin: 8px 0;
+    }
+    #note-content-body blockquote {
+      border-left: 2px solid rgba(0,255,200,0.3);
+      padding-left: 8px; color: rgba(200,220,240,0.6);
+      margin-bottom: 6px;
+    }
+
+    /* ── Footer ── */
+    #panel-footer {
+      margin-top: 8px; padding-top: 7px;
+      border-top: 1px solid rgba(255,255,255,0.05);
+      font-size: 9px; color: rgba(255,255,255,0.18);
+      text-align: center; letter-spacing: 0.3px;
+    }
+  </style>
+</head>
+<body>
+  <div id="panel">
+    <div id="panel-header">
+      <button id="back-btn" title="Back to list">&#8592;</button>
+      <span id="panel-title">&#128221; Nova Notes</span>
+      <button id="close-btn" title="Close">&#10005;</button>
+    </div>
+
+    <div id="status-bar">
+      <div class="pulse-dot"></div>
+      <span id="status-text">Writing your note...</span>
+    </div>
+
+    <!-- List view -->
+    <div id="list-view">
+      <div id="search-hint"></div>
+      <div id="notes-list">
+        <div id="no-notes">No notes yet — ask Nova to create one!</div>
+      </div>
+    </div>
+
+    <!-- Note view -->
+    <div id="note-view">
+      <div id="note-content-title"></div>
+      <div id="note-content-body"></div>
+    </div>
+
+    <div id="panel-footer">Nova AI &middot; Nova Notes</div>
+  </div>
+
+  <script>
+    const { ipcRenderer } = require('electron');
+
+    const statusBar        = document.getElementById('status-bar');
+    const statusText       = document.getElementById('status-text');
+    const listView         = document.getElementById('list-view');
+    const noteView         = document.getElementById('note-view');
+    const notesList        = document.getElementById('notes-list');
+    const noNotes          = document.getElementById('no-notes');
+    const searchHint       = document.getElementById('search-hint');
+    const noteContentTitle = document.getElementById('note-content-title');
+    const noteContentBody  = document.getElementById('note-content-body');
+    const backBtn          = document.getElementById('back-btn');
+    const closeBtn         = document.getElementById('close-btn');
+    const panelTitle       = document.getElementById('panel-title');
+
+    closeBtn.addEventListener('click', () => ipcRenderer.send('notes-panel-hide'));
+    backBtn.addEventListener('click', () => showListMode());
+
+    function showListMode() {
+      listView.style.display = 'flex';
+      noteView.style.display = 'none';
+      backBtn.style.display  = 'none';
+      panelTitle.textContent = '\uD83D\uDCCB Nova Notes';
+    }
+
+    function showNoteMode(note) {
+      listView.style.display = 'none';
+      noteView.style.display = 'flex';
+      backBtn.style.display  = 'block';
+      panelTitle.textContent = '\uD83D\uDCCB Note';
+      noteContentTitle.textContent = note.title;
+      noteContentBody.innerHTML = renderMarkdown(note.content);
+    }
+
+    function renderMarkdown(md) {
+      if (!md) return '';
+      let html = md
+        // Escape HTML
+        .replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;')
+        // Code blocks (before inline code)
+        .replace(/```[\w]*\n([\s\S]*?)```/g, '<pre><code>$1</code></pre>')
+        // Inline code
+        .replace(/`([^`]+)`/g, '<code>$1</code>')
+        // Bold
+        .replace(/\*\*(.+?)\*\*/g, '<strong>$1</strong>')
+        // Italic
+        .replace(/\*(.+?)\*/g, '<em>$1</em>')
+        // H1 (suppress — shown as title above)
+        .replace(/^# .+$/gm, '')
+        // H2
+        .replace(/^## (.+)$/gm, '<h2>$1</h2>')
+        // H3
+        .replace(/^### (.+)$/gm, '<h3>$1</h3>')
+        // HR
+        .replace(/^---+$/gm, '<hr>')
+        // Blockquote
+        .replace(/^> (.+)$/gm, '<blockquote>$1</blockquote>')
+        // Numbered list items
+        .replace(/^\d+\. (.+)$/gm, '<li>$1</li>')
+        // Bullet list items
+        .replace(/^[\-\*] (.+)$/gm, '<li>$1</li>')
+        // Wrap consecutive <li> in <ul>
+        .replace(/(<li>.*<\/li>\n?)+/g, m => '<ul>' + m + '</ul>');
+
+      // Wrap remaining lines as paragraphs
+      html = html.split('\n').map(line => {
+        line = line.trim();
+        if (!line) return '';
+        if (line.match(/^<(h[123]|ul|ol|li|pre|hr|blockquote)/)) return line;
+        return '<p>' + line + '</p>';
+      }).join('');
+
+      return html;
+    }
+
+    function renderNotesList(notes, searchQuery) {
+      notesList.querySelectorAll('.note-card').forEach(el => el.remove());
+      searchHint.textContent = searchQuery ? `Showing results for: "${searchQuery}"` : '';
+
+      if (!notes || notes.length === 0) {
+        noNotes.style.display = 'block';
+        return;
+      }
+      noNotes.style.display = 'none';
+
+      notes.forEach(note => {
+        const card = document.createElement('div');
+        card.className = 'note-card';
+
+        const titleEl = document.createElement('div');
+        titleEl.className = 'note-card-title';
+        titleEl.textContent = note.title;
+
+        const previewEl = document.createElement('div');
+        previewEl.className = 'note-card-preview';
+        previewEl.textContent = note.preview || '';
+
+        const dateEl = document.createElement('div');
+        dateEl.className = 'note-card-date';
+        if (note.modified) {
+          const d = new Date(note.modified);
+          dateEl.textContent = d.toLocaleDateString('en-US', { month: 'short', day: 'numeric', year: 'numeric' });
+        }
+
+        card.appendChild(titleEl);
+        card.appendChild(previewEl);
+        card.appendChild(dateEl);
+
+        card.addEventListener('click', () => {
+          ipcRenderer.send('notes-panel-open-note', note.title);
+        });
+
+        notesList.appendChild(card);
+      });
+    }
+
+    // ── IPC from main process ─────────────────────────────────────────────
+    ipcRenderer.on('notes-panel-data', (event, data) => {
+      const { mode, notes, note, noteTitle, searchQuery, updating, message } = data;
+
+      // Hide status bar first
+      statusBar.classList.remove('visible');
+
+      if (mode === 'writing') {
+        statusBar.classList.add('visible');
+        statusText.textContent = updating
+          ? `Updating "${noteTitle}"...`
+          : `Writing "${noteTitle}"...`;
+        // Keep list view visible underneath
+        showListMode();
+        return;
+      }
+
+      if (mode === 'searching') {
+        statusBar.classList.add('visible');
+        statusText.textContent = 'Searching your notes...';
+        return;
+      }
+
+      if (mode === 'list') {
+        showListMode();
+        renderNotesList(notes || [], searchQuery || '');
+        return;
+      }
+
+      if (mode === 'note' && note) {
+        showNoteMode(note);
+        return;
+      }
+
+      if (mode === 'error') {
+        statusBar.classList.add('visible');
+        statusText.textContent = 'Error: ' + (message || 'Something went wrong');
+      }
+    });
+  </script>
+</body>
+</html>

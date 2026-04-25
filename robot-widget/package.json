@@ -1,0 +1,20 @@
+{
+  "name": "robot-widget",
+  "version": "1.0.0",
+  "description": "Sci-fi worker robot desktop widget",
+  "main": "main.js",
+  "scripts": {
+    "start": "electron . --no-sandbox --disable-gpu-sandbox --enable-transparent-visuals --enable-logging --ozone-platform=x11",
+    "setup-google": "node scripts/setup_google_auth.js"
+  },
+  "dependencies": {
+    "@google/genai": "^1.48.0",
+    "dotenv": "^17.3.1",
+    "googleapis": "^144.0.0",
+    "three": "^0.163.0",
+    "vosk-browser": "^0.0.8"
+  },
+  "devDependencies": {
+    "electron": "^41.2.0"
+  }
+}

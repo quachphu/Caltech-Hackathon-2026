@@ -1,0 +1,338 @@
+<!DOCTYPE html>
+<html>
+
+<head>
+    <style>
+        body,
+        html {
+            margin: 0;
+            padding: 0;
+            height: 100%;
+            overflow: hidden;
+            font-family: 'Inter', system-ui, -apple-system, sans-serif;
+            background: #0a0a0f;
+        }
+
+        #browser-header {
+            height: 40px;
+            background: rgba(15, 15, 25, 0.8);
+            backdrop-filter: blur(10px);
+            border-bottom: 1px solid rgba(0, 255, 255, 0.2);
+            display: flex;
+            align-items: center;
+            padding: 0 15px;
+            color: #0ff;
+            font-size: 13px;
+            font-weight: 500;
+            letter-spacing: 0.5px;
+        }
+
+        #status-dot {
+            width: 8px;
+            height: 8px;
+            background: #0ff;
+            border-radius: 50%;
+            margin-right: 10px;
+            box-shadow: 0 0 10px #0ff;
+            animation: pulse 2s infinite;
+        }
+
+        @keyframes pulse {
+            0% { opacity: 0.6; }
+            50% { opacity: 1; transform: scale(1.1); }
+            100% { opacity: 0.6; }
+        }
+
+        #browser-container {
+            height: calc(100% - 40px);
+            width: 100%;
+        }
+
+        webview {
+            width: 100%;
+            height: 100%;
+            background: #fff;
+        }
+
+        #url-display {
+            opacity: 0.6;
+            font-size: 11px;
+            margin-left: auto;
+        }
+    </style>
+</head>
+
+<body>
+    <div id="browser-header">
+        <div id="status-dot"></div>
+        NOVA BROWSER AGENT
+        <div id="incognito-badge" style="display:none; margin-left:10px; background:rgba(120,80,180,0.35); border:1px solid rgba(180,120,255,0.55); border-radius:4px; padding:1px 8px; font-size:11px; color:#d0a0ff; letter-spacing:0.5px;">INCOGNITO</div>
+        <div id="url-display">Loading...</div>
+    </div>
+    <div id="browser-container">
+        <!-- webview is created dynamically so we can set partition before first navigation -->
+    </div>
+
+    <script>
+        const { ipcRenderer } = require('electron');
+
+        // Determine incognito mode from URL query param (set by main.js at window creation)
+        const _urlParams = new URLSearchParams(window.location.search);
+        const _isIncognito = _urlParams.get('incognito') === '1';
+
+        // Create webview with the correct partition BEFORE any navigation
+        const webview = document.createElement('webview');
+        webview.id = 'main-webview';
+        webview.setAttribute('allowpopups', '');
+        webview.style.cssText = 'width:100%;height:100%;background:#fff;';
+        if (!_isIncognito) {
+            // Persistent session: cookies, localStorage, logins all survive between browser opens
+            webview.partition = 'persist:nova-browser';
+        }
+        // Incognito: no partition → Electron uses a fresh temporary session (no persistence)
+        webview.src = 'about:blank';
+        document.getElementById('browser-container').appendChild(webview);
+
+        // Show incognito badge when in incognito mode
+        if (_isIncognito) {
+            document.getElementById('incognito-badge').style.display = 'block';
+            document.getElementById('status-dot').style.background = '#a06cff';
+            document.getElementById('status-dot').style.boxShadow = '0 0 10px #a06cff';
+        }
+
+        const urlDisplay = document.getElementById('url-display');
+
+        webview.addEventListener('did-start-loading', () => {
+            urlDisplay.innerText = "Loading...";
+        });
+
+        webview.addEventListener('did-stop-loading', () => {
+            urlDisplay.innerText = webview.getURL();
+        });
+
+        // Report every completed navigation to main so Nova can detect store pages
+        webview.addEventListener('did-finish-load', () => {
+            const url = webview.getURL();
+            if (!url || url === 'about:blank') return;
+            webview.executeJavaScript(`
+                ({ url: location.href, title: document.title })
+            `).then(info => {
+                ipcRenderer.send('browser-page-loaded', info);
+            }).catch(() => {
+                ipcRenderer.send('browser-page-loaded', { url, title: '' });
+            });
+        });
+
+        // Send ready signal to main process
+        window.addEventListener('DOMContentLoaded', () => {
+            ipcRenderer.send('browser-ready');
+        });
+
+        // ── NAVIGATION ───────────────────────────────────────────────────────
+        ipcRenderer.on('navigate', (event, url) => {
+            console.log('🌐 Browser: Navigating to', url);
+            webview.src = url;
+        });
+
+        // ── SCROLLING ────────────────────────────────────────────────────────
+        ipcRenderer.on('scroll', (event, direction) => {
+            let script;
+            if (direction === 'top') {
+                script = `window.scrollTo({ top: 0, behavior: 'smooth' })`;
+            } else if (direction === 'bottom') {
+                script = `window.scrollTo({ top: document.body.scrollHeight, behavior: 'smooth' })`;
+            } else {
+                const amount = direction === 'down' ? 600 : -600;
+                script = `window.scrollBy({ top: ${amount}, behavior: 'smooth' })`;
+            }
+            console.log('📜 Browser: Scrolling', direction);
+            webview.executeJavaScript(script).catch(console.error);
+        });
+
+        // ── DOM MAPPING ──────────────────────────────────────────────────────
+        ipcRenderer.on('get-dom-map', (event) => {
+            console.log('🧠 Browser: Generating DOM Map...');
+            webview.executeJavaScript(`
+                (function() {
+                    const elements = Array.from(document.querySelectorAll('button, a, input, [role="button"], [onclick], h3, h2, h1, .ytp-ad-skip-button, ytd-thumbnail, ytd-video-renderer, img, [class*="price"], [class*="Price"], [data-testid*="price"], [class*="variant"], [class*="option"], [class*="config"], [class*="storage"], [class*="size"], [class*="model"], [class*="plan"], [class*="tier"], label, [role="radio"], [role="option"], [role="tab"]'));
+                    return elements
+                        .filter(el => {
+                            const rect = el.getBoundingClientRect();
+                            if (rect.width <= 1 || rect.height <= 1) return false;
+                            const style = window.getComputedStyle(el);
+                            if (style.visibility === 'hidden' || style.display === 'none' || style.opacity === '0') return false;
+                            return true;
+                        })
+                        .map((el, index) => {
+                            el.setAttribute('nova-id', index);
+                            return {
+                                id: index,
+                                tag: el.tagName,
+                                text: (el.innerText || el.ariaLabel || el.placeholder || el.title || "").trim().substring(0, 120),
+                                type: el.type || el.getAttribute('role') || ""
+                            };
+                        });
+                })()
+            `).then(map => {
+                ipcRenderer.send('dom-map-results', { map, url: webview.getURL() });
+            }).catch(err => {
+                console.error('❌ DOM Map Error:', err);
+                ipcRenderer.send('dom-map-results', { map: [], url: webview.getURL() });
+            });
+        });
+
+        // ── CLICK BY ID ──────────────────────────────────────────────────────
+        ipcRenderer.on('click-by-id', (event, id) => {
+            console.log('🖱️ Browser: Clicking by ID', id, typeof id);
+            webview.executeJavaScript(`
+                (function() {
+                    const el = document.querySelector('[nova-id="${id}"]');
+                    console.log('[Nova click-by-id] id=${id}, found:', el ? el.tagName : 'NULL');
+                    if (!el) {
+                        // Fallback: index into the full clickable list
+                        const all = Array.from(document.querySelectorAll(
+                            'button,a,input,[role="button"],[onclick],h3,.ytp-ad-skip-button,ytd-thumbnail,ytd-video-renderer,img'
+                        )).filter(e => { const r=e.getBoundingClientRect(); return r.width>1&&r.height>1; });
+                        const fallback = all[${id}];
+                        console.log('[Nova click-by-id] fallback at index ${id}:', fallback ? fallback.tagName : 'NULL');
+                        if (!fallback) return 'NOT_FOUND';
+                        fallback.scrollIntoView({ behavior: 'auto', block: 'center' });
+                        try { fallback.focus(); } catch(_) {}
+                        try { fallback.click(); } catch(_) {}
+                        try { fallback.dispatchEvent(new MouseEvent('click', { bubbles:true, cancelable:true, view:window })); } catch(_) {}
+                        return 'FALLBACK_CLICKED';
+                    }
+
+                    el.scrollIntoView({ behavior: 'auto', block: 'center' });
+
+                    // Ripple effect
+                    const rect = el.getBoundingClientRect();
+                    const x = rect.left + rect.width / 2;
+                    const y = rect.top + rect.height / 2;
+                    const ripple = document.createElement('div');
+                    ripple.style.cssText = 'position:fixed;z-index:999999;border:4px solid #0ff;border-radius:50%;pointer-events:none;width:60px;height:60px;left:'+(x-30)+'px;top:'+(y-30)+'px;transition:all 0.4s;opacity:1;transform:scale(0.3);box-shadow:0 0 12px #0ff;';
+                    document.body.appendChild(ripple);
+                    setTimeout(() => { ripple.style.transform = 'scale(1.5)'; ripple.style.opacity = '0'; }, 10);
+                    setTimeout(() => ripple.remove(), 500);
+
+                    // Fire DOM events immediately (scroll is instant via 'auto')
+                    try { el.focus(); } catch(_) {}
+                    try { el.click(); } catch(_) {}
+                    try { el.dispatchEvent(new MouseEvent('mousedown', { bubbles:true, cancelable:true, view:window })); } catch(_) {}
+                    try { el.dispatchEvent(new MouseEvent('mouseup',   { bubbles:true, cancelable:true, view:window })); } catch(_) {}
+                    try { el.dispatchEvent(new MouseEvent('click',     { bubbles:true, cancelable:true, view:window })); } catch(_) {}
+                    return 'CLICKED';
+                })()
+            `).then(res => {
+                console.log('🖱️ click-by-id result:', res);
+            }).catch(err => {
+                console.error('🖱️ click-by-id ERROR:', err);
+            });
+        });
+
+        // ── SMART CLICK (by text) ─────────────────────────────────────────────
+        ipcRenderer.on('smart-click', (event, targetText) => {
+            console.log('🖱️ Browser: Smart clicking for', targetText);
+            const escapedText = JSON.stringify(String(targetText).toLowerCase().trim());
+            webview.executeJavaScript(`
+                (async function() {
+                    // Wait for the page to fully load before querying the DOM.
+                    // This prevents clicking on half-rendered elements when smart_click
+                    // fires immediately after an 'open' command.
+                    if (document.readyState !== 'complete') {
+                        await Promise.race([
+                            new Promise(r => window.addEventListener('load', r, { once: true })),
+                            new Promise(r => setTimeout(r, 4000)) // 4s max wait
+                        ]);
+                    }
+
+                    const q = ${escapedText};
+                    const words = q.split(/\\s+/).filter(w => w.length > 1);
+
+                    // Only consider elements the user can actually see right now.
+                    // This prevents clicking off-screen suggestions or sidebar cards
+                    // that match the query but are not what the user is looking at.
+                    const inViewport = (r) =>
+                        r.width > 1 && r.height > 1 &&
+                        r.bottom > 0 && r.top < window.innerHeight &&
+                        r.right  > 0 && r.left < window.innerWidth;
+
+                    const candidates = Array.from(document.querySelectorAll(
+                        'button, a, input, [role="button"], [onclick], h3, nav *, header *, [aria-label], [data-testid], [class*="menu"], [class*="nav"], [class*="toggle"], [class*="hamburger"]'
+                    )).filter(e => inViewport(e.getBoundingClientRect()));
+
+                    const getAttrs = (el) => [
+                        el.innerText,
+                        el.textContent,
+                        el.getAttribute('aria-label'),
+                        el.title,
+                        el.placeholder,
+                        el.getAttribute('data-testid'),
+                        el.getAttribute('data-label'),
+                        el.getAttribute('data-tooltip'),
+                        el.getAttribute('name'),
+                        el.id,
+                        el.getAttribute('class')
+                    ].map(v => String(v || '')).join(' ').toLowerCase();
+
+                    const score = (el) => {
+                        const t = getAttrs(el).trim();
+                        if (!t) return 0;
+                        let s = 0;
+                        if (t === q) s = 100;
+                        else if (t.startsWith(q)) s = 90;
+                        else if (t.includes(q)) s = 80;
+                        else {
+                            const matched = words.filter(w => t.includes(w)).length;
+                            if (matched === words.length && words.length > 0) s = 70;
+                            else if (matched > 0) s = matched * 20;
+                        }
+                        if (s === 0) return 0;
+                        // Prefer real links and buttons over generic text spans —
+                        // avoids clicking autocomplete/suggestion SPANs that look
+                        // like the target but navigate somewhere unexpected.
+                        const tag = el.tagName.toLowerCase();
+                        if (tag === 'a' && el.href) s += 15;
+                        else if (tag === 'button') s += 10;
+                        else if (tag === 'input') s += 5;
+                        return s;
+                    };
+
+                    let best = null, bestScore = 0;
+                    for (const el of candidates) {
+                        const s = score(el);
+                        if (s > bestScore) { bestScore = s; best = el; }
+                    }
+
+                    // Last-resort: viewport-visible elements only (still no off-screen matches)
+                    if (!best || bestScore === 0) {
+                        const all = Array.from(document.querySelectorAll('*')).filter(e =>
+                            inViewport(e.getBoundingClientRect())
+                        );
+                        for (const el of all) {
+                            const s = score(el);
+                            if (s > bestScore) { bestScore = s; best = el; }
+                        }
+                    }
+
+                    console.log('[Nova smart-click] query:"' + q + '" bestScore:' + bestScore + ' el:', best ? best.tagName + ' class="' + (best.className||'').substring(0,40) + '" label="' + (best.getAttribute('aria-label')||'') + '"' : 'NULL');
+                    if (!best || bestScore === 0) return 'NOT_FOUND';
+
+                    best.scrollIntoView({ behavior: 'auto', block: 'center' });
+                    try { best.focus(); } catch(_) {}
+                    try { best.click(); } catch(_) {}
+                    try { best.dispatchEvent(new MouseEvent('mousedown', { bubbles:true, cancelable:true, view:window })); } catch(_) {}
+                    try { best.dispatchEvent(new MouseEvent('mouseup',   { bubbles:true, cancelable:true, view:window })); } catch(_) {}
+                    try { best.dispatchEvent(new MouseEvent('click',     { bubbles:true, cancelable:true, view:window })); } catch(_) {}
+                    return 'CLICKED:' + best.tagName + ':score=' + bestScore + ':' + (best.getAttribute('aria-label') || best.innerText || best.className || '').substring(0,30);
+                })()
+            `).then(res => {
+                console.log('🖱️ smart-click result:', res);
+            }).catch(err => {
+                console.error('🖱️ smart-click ERROR:', err);
+            });
+        });
+    </script>
+</body>
+
+</html>

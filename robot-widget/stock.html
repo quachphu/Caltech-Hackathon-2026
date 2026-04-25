@@ -1,0 +1,492 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <style>
+    * { margin: 0; padding: 0; box-sizing: border-box; }
+
+    html, body {
+      width: 340px;
+      background: transparent;
+      overflow: hidden;
+      font-family: -apple-system, 'Segoe UI', Helvetica, Arial, sans-serif;
+      -webkit-user-select: none;
+      user-select: none;
+    }
+
+    .card {
+      background: rgba(8, 7, 4, 0.96);
+      border: 1px solid rgba(235, 195, 55, 0.22);
+      border-radius: 18px;
+      padding: 18px 20px 16px;
+      box-shadow:
+        0 20px 60px rgba(0, 0, 0, 0.75),
+        0 0 0 1px rgba(255, 255, 255, 0.03),
+        0 0 40px rgba(235, 195, 55, 0.05);
+      position: relative;
+      overflow: hidden;
+    }
+
+    /* top accent line */
+    .card::before {
+      content: '';
+      position: absolute;
+      top: 0; left: 20%; right: 20%;
+      height: 1px;
+      background: linear-gradient(90deg, transparent, rgba(235,195,55,0.5), transparent);
+    }
+
+    /* Close button */
+    .close-btn {
+      position: absolute;
+      top: 11px; right: 12px;
+      background: rgba(255,255,255,0.06);
+      border: none;
+      color: rgba(255,255,255,0.3);
+      border-radius: 50%;
+      width: 22px; height: 22px;
+      cursor: pointer;
+      font-size: 12px;
+      display: flex; align-items: center; justify-content: center;
+      transition: background 0.2s, color 0.2s;
+      flex-shrink: 0;
+      -webkit-app-region: no-drag;
+    }
+    .close-btn:hover { background: rgba(255, 70, 70, 0.28); color: #fff; }
+
+    /* Header */
+    .header {
+      display: flex;
+      justify-content: space-between;
+      align-items: flex-start;
+      margin-bottom: 10px;
+      padding-right: 26px;
+    }
+
+    .company-name {
+      font-size: 15px;
+      font-weight: 600;
+      color: #fff;
+      letter-spacing: -0.2px;
+      line-height: 1.2;
+    }
+
+    .ticker-line {
+      font-size: 10px;
+      color: rgba(235,195,55,0.65);
+      letter-spacing: 0.8px;
+      font-weight: 600;
+      margin-top: 3px;
+    }
+
+    /* Price */
+    .price-section {
+      display: flex;
+      align-items: baseline;
+      gap: 10px;
+      margin-bottom: 3px;
+    }
+
+    .price {
+      font-size: 34px;
+      font-weight: 200;
+      color: #fff;
+      letter-spacing: -1.5px;
+      line-height: 1;
+    }
+
+    .change-badge {
+      font-size: 13px;
+      font-weight: 600;
+      padding: 2px 8px;
+      border-radius: 6px;
+    }
+    .change-badge.up   { color: #00d4aa; background: rgba(0,212,170,0.12); }
+    .change-badge.down { color: #ff4d6a; background: rgba(255,77,106,0.12); }
+    .change-badge.flat { color: rgba(255,255,255,0.45); background: rgba(255,255,255,0.06); }
+
+    /* Meta */
+    .meta {
+      font-size: 10px;
+      color: rgba(255,255,255,0.25);
+      margin-bottom: 12px;
+      letter-spacing: 0.3px;
+    }
+
+    /* Stats */
+    .stats-row {
+      display: flex;
+      gap: 0;
+      margin-bottom: 14px;
+    }
+    .stat {
+      flex: 1;
+      border-right: 1px solid rgba(255,255,255,0.06);
+      padding-right: 10px;
+      margin-right: 10px;
+    }
+    .stat:last-child { border-right: none; margin-right: 0; padding-right: 0; }
+    .stat-label {
+      font-size: 9px;
+      color: rgba(255,255,255,0.25);
+      letter-spacing: 0.5px;
+      margin-bottom: 2px;
+      text-transform: uppercase;
+    }
+    .stat-value {
+      font-size: 12px;
+      color: rgba(255,255,255,0.7);
+      font-weight: 500;
+    }
+
+    /* Chart */
+    .chart-wrap {
+      margin: 0 -2px 4px;
+      position: relative;
+    }
+    #stockCanvas {
+      display: block;
+      width: 100%;
+    }
+
+    .chart-time-labels {
+      display: flex;
+      justify-content: space-between;
+      font-size: 9px;
+      color: rgba(255,255,255,0.18);
+      margin-bottom: 12px;
+      padding: 0 2px;
+    }
+
+    /* Divider */
+    .divider {
+      height: 1px;
+      background: rgba(255,255,255,0.06);
+      margin-bottom: 10px;
+    }
+
+    /* Outlook */
+    .outlook {
+      background: rgba(235,195,55,0.04);
+      border-left: 2px solid rgba(235,195,55,0.35);
+      border-radius: 0 6px 6px 0;
+      padding: 7px 10px;
+    }
+    .outlook-label {
+      font-size: 9px;
+      color: rgba(235,195,55,0.6);
+      font-weight: 700;
+      letter-spacing: 1px;
+      text-transform: uppercase;
+      margin-bottom: 3px;
+    }
+    .outlook-text {
+      font-size: 11px;
+      color: rgba(255,255,255,0.6);
+      line-height: 1.5;
+    }
+
+    /* Loading */
+    .loading-state {
+      text-align: center;
+      padding: 32px 0;
+      color: rgba(235,195,55,0.45);
+      font-size: 11px;
+      letter-spacing: 0.5px;
+    }
+    .spinner {
+      width: 22px; height: 22px;
+      border: 2px solid rgba(235,195,55,0.12);
+      border-top-color: rgba(235,195,55,0.55);
+      border-radius: 50%;
+      animation: spin 0.75s linear infinite;
+      margin: 0 auto 10px;
+    }
+    @keyframes spin { to { transform: rotate(360deg); } }
+
+    /* Error */
+    .error-state {
+      text-align: center;
+      padding: 24px 0;
+      color: rgba(255,100,100,0.65);
+      font-size: 11px;
+      line-height: 1.6;
+    }
+
+    /* Auto-close timer bar at bottom */
+    .timer-bar {
+      position: absolute;
+      bottom: 0; left: 0;
+      height: 2px;
+      background: rgba(235,195,55,0.28);
+      border-radius: 0 0 18px 18px;
+    }
+
+    /* NOVA badge top-left */
+    .nova-badge {
+      position: absolute;
+      top: 11px; left: 14px;
+      font-size: 8px;
+      color: rgba(235,195,55,0.35);
+      letter-spacing: 1.5px;
+      font-weight: 700;
+      text-transform: uppercase;
+    }
+  </style>
+</head>
+<body>
+  <div class="card" id="card">
+    <div class="nova-badge">NOVA</div>
+    <button class="close-btn" id="closeBtn">✕</button>
+
+    <!-- Loading state -->
+    <div id="loadingState" class="loading-state">
+      <div class="spinner"></div>
+      Fetching market data...
+    </div>
+
+    <!-- Main content -->
+    <div id="mainContent" style="display:none; padding-top:4px;">
+      <div class="header">
+        <div>
+          <div class="company-name" id="companyName">—</div>
+          <div class="ticker-line" id="tickerLine">—</div>
+        </div>
+      </div>
+
+      <div class="price-section">
+        <div class="price" id="priceDisplay">—</div>
+        <div class="change-badge flat" id="changeBadge">—</div>
+      </div>
+
+      <div class="meta" id="metaLine">—</div>
+
+      <div class="stats-row">
+        <div class="stat">
+          <div class="stat-label">52W High</div>
+          <div class="stat-value" id="high52">—</div>
+        </div>
+        <div class="stat">
+          <div class="stat-label">52W Low</div>
+          <div class="stat-value" id="low52">—</div>
+        </div>
+        <div class="stat">
+          <div class="stat-label">Volume</div>
+          <div class="stat-value" id="volume">—</div>
+        </div>
+      </div>
+
+      <div class="chart-wrap">
+        <canvas id="stockCanvas" height="90"></canvas>
+      </div>
+      <div class="chart-time-labels">
+        <span id="labelStart">3 months ago</span>
+        <span style="color:rgba(255,255,255,0.12)">─── 3-Month History ───</span>
+        <span>Today</span>
+      </div>
+
+      <div class="divider"></div>
+
+      <div class="outlook">
+        <div class="outlook-label">Nova Outlook</div>
+        <div class="outlook-text" id="outlookText">Analyzing trend data...</div>
+      </div>
+    </div>
+
+    <!-- Error state -->
+    <div id="errorState" class="error-state" style="display:none">
+      Could not fetch market data.<br>
+      Check your internet connection.
+    </div>
+
+    <!-- Timer bar -->
+    <div class="timer-bar" id="timerBar" style="width:100%"></div>
+  </div>
+
+  <script>
+    const { ipcRenderer } = require('electron');
+
+    // Close button
+    document.getElementById('closeBtn').addEventListener('click', () => {
+      ipcRenderer.send('close-stock-window');
+    });
+
+    // Auto-close countdown bar
+    let autoCloseHandle = null;
+    const AUTO_CLOSE_MS = 50000; // 50 seconds
+
+    function startAutoClose() {
+      const bar = document.getElementById('timerBar');
+      // Trigger CSS transition on next frame
+      requestAnimationFrame(() => {
+        bar.style.transition = `width ${AUTO_CLOSE_MS}ms linear`;
+        bar.style.width = '0%';
+      });
+      autoCloseHandle = setTimeout(() => {
+        ipcRenderer.send('close-stock-window');
+      }, AUTO_CLOSE_MS);
+    }
+
+    // Chart drawing (pure Canvas, no external library)
+    function drawChart(canvas, prices, isUp) {
+      // Flatten nulls (weekends/gaps) by interpolating linearly
+      const valid = prices.filter(p => p !== null && !isNaN(p));
+      if (valid.length < 2) return;
+
+      const W = canvas.offsetWidth || 300;
+      const H = 90;
+      const dpr = window.devicePixelRatio || 1;
+      canvas.width  = W * dpr;
+      canvas.height = H * dpr;
+      canvas.style.height = H + 'px';
+      const ctx = canvas.getContext('2d');
+      ctx.scale(dpr, dpr);
+
+      const pad = { top: 8, bottom: 6 };
+      const plotH = H - pad.top - pad.bottom;
+
+      const min = Math.min(...valid);
+      const max = Math.max(...valid);
+      const range = max - min || 1;
+
+      // Build x/y coordinates — skip nulls
+      const pts = [];
+      prices.forEach((p, i) => {
+        if (p !== null && !isNaN(p)) {
+          pts.push({
+            x: (i / (prices.length - 1)) * W,
+            y: pad.top + plotH - ((p - min) / range) * plotH
+          });
+        }
+      });
+      if (pts.length < 2) return;
+
+      const lineColor = isUp ? '#00d4aa' : '#ff4d6a';
+      const fillTop   = isUp ? 'rgba(0,212,170,0.28)' : 'rgba(255,77,106,0.28)';
+
+      // Gradient fill
+      const grad = ctx.createLinearGradient(0, pad.top, 0, H);
+      grad.addColorStop(0, fillTop);
+      grad.addColorStop(1, 'rgba(0,0,0,0)');
+
+      // Smooth path using quadratic bezier midpoints
+      function buildPath() {
+        ctx.moveTo(pts[0].x, pts[0].y);
+        for (let i = 1; i < pts.length; i++) {
+          const mx = (pts[i-1].x + pts[i].x) / 2;
+          const my = (pts[i-1].y + pts[i].y) / 2;
+          ctx.quadraticCurveTo(pts[i-1].x, pts[i-1].y, mx, my);
+        }
+        ctx.lineTo(pts[pts.length-1].x, pts[pts.length-1].y);
+      }
+
+      // Fill
+      ctx.beginPath();
+      buildPath();
+      ctx.lineTo(pts[pts.length-1].x, H);
+      ctx.lineTo(pts[0].x, H);
+      ctx.closePath();
+      ctx.fillStyle = grad;
+      ctx.fill();
+
+      // Line stroke
+      ctx.beginPath();
+      buildPath();
+      ctx.strokeStyle = lineColor;
+      ctx.lineWidth = 2;
+      ctx.lineJoin = 'round';
+      ctx.lineCap = 'round';
+      ctx.stroke();
+
+      // Current-price dot
+      const last = pts[pts.length - 1];
+      ctx.beginPath();
+      ctx.arc(last.x, last.y, 4.5, 0, Math.PI * 2);
+      ctx.fillStyle = lineColor;
+      ctx.fill();
+      ctx.beginPath();
+      ctx.arc(last.x, last.y, 2.2, 0, Math.PI * 2);
+      ctx.fillStyle = '#fff';
+      ctx.fill();
+
+      // Horizontal midline (faint)
+      const midY = pad.top + plotH / 2;
+      ctx.setLineDash([3, 5]);
+      ctx.strokeStyle = 'rgba(255,255,255,0.07)';
+      ctx.lineWidth = 1;
+      ctx.beginPath();
+      ctx.moveTo(0, midY);
+      ctx.lineTo(W, midY);
+      ctx.stroke();
+      ctx.setLineDash([]);
+    }
+
+    function fmt(n, dec = 2) {
+      return n != null ? n.toFixed(dec) : '—';
+    }
+
+    function fmtVol(v) {
+      if (!v) return '—';
+      if (v >= 1e9) return (v / 1e9).toFixed(1) + 'B';
+      if (v >= 1e6) return (v / 1e6).toFixed(1) + 'M';
+      if (v >= 1e3) return (v / 1e3).toFixed(0) + 'K';
+      return v.toString();
+    }
+
+    // Receive stock data from main process
+    ipcRenderer.on('stock-data', (event, data) => {
+      document.getElementById('loadingState').style.display = 'none';
+
+      if (data.error) {
+        document.getElementById('errorState').style.display = 'block';
+        startAutoClose();
+        return;
+      }
+
+      document.getElementById('mainContent').style.display = 'block';
+
+      // Company / ticker
+      document.getElementById('companyName').textContent = data.company || 'Unknown';
+      document.getElementById('tickerLine').textContent =
+        `${data.symbol || ''}${data.exchange ? ' · ' + data.exchange : ''}`;
+
+      // Price
+      const price = data.price || 0;
+      document.getElementById('priceDisplay').textContent = `$${fmt(price)}`;
+
+      // Change
+      const chg = data.change || 0;
+      const pct = data.changePct || 0;
+      const sign = chg >= 0 ? '+' : '';
+      const badgeEl = document.getElementById('changeBadge');
+      badgeEl.textContent = `${sign}${fmt(chg)} (${sign}${fmt(pct)}%)`;
+      const dir = Math.abs(pct) < 0.05 ? 'flat' : (chg >= 0 ? 'up' : 'down');
+      badgeEl.className = `change-badge ${dir}`;
+
+      // Meta
+      document.getElementById('metaLine').textContent =
+        `${data.currency || 'USD'} · Market data · ${new Date().toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' })}`;
+
+      // Stats
+      document.getElementById('high52').textContent = data.high52 ? `$${fmt(data.high52)}` : '—';
+      document.getElementById('low52').textContent  = data.low52  ? `$${fmt(data.low52)}`  : '—';
+      document.getElementById('volume').textContent  = fmtVol(data.volume);
+
+      // Date label
+      if (data.firstDate) document.getElementById('labelStart').textContent = data.firstDate;
+
+      // Chart
+      const canvas = document.getElementById('stockCanvas');
+      const isUp = chg >= 0;
+      // Draw after layout settles
+      requestAnimationFrame(() => drawChart(canvas, data.prices || [], isUp));
+
+      // Outlook
+      document.getElementById('outlookText').textContent = data.outlook || 'Insufficient data.';
+
+      // Start auto-close
+      startAutoClose();
+    });
+  </script>
+</body>
+</html>

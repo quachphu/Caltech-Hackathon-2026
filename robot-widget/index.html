@@ -1,0 +1,344 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>Nova</title>
+  <style>
+    *, *::before, *::after { margin: 0; padding: 0; box-sizing: border-box; }
+
+    html, body {
+      width: 100%;
+      height: 100%;
+      overflow: hidden;
+      background: transparent;
+      user-select: none;
+      -webkit-user-select: none;
+      display: flex;
+      align-items: center;
+      justify-content: center;
+    }
+
+    /* ── Root ── */
+    #widget {
+      position: relative;
+      width: 120px;
+      height: 120px;
+      display: flex;
+      align-items: center;
+      justify-content: center;
+      /* Smooth power-up when offline class is removed */
+      transition: filter 1.6s ease, opacity 1.6s ease;
+    }
+
+    /* ── OFFLINE / BOOT state — dark grey, dormant ── */
+    #widget.offline {
+      filter: grayscale(1) brightness(0.12);
+      opacity: 0.7;
+    }
+
+    /* ── Thin spinning arc (conic-gradient + mask = ring-slice) ── */
+    #arc {
+      position: absolute;
+      width: 90px;
+      height: 90px;
+      border-radius: 50%;
+      background: conic-gradient(
+        from 0deg,
+        transparent   0deg,
+        transparent   62deg,
+        rgba(212,168,42,0.50)  78deg,
+        rgba(252,218,62,1.00) 108deg,
+        rgba(212,168,42,0.50) 124deg,
+        transparent  140deg,
+        transparent  360deg
+      );
+      /* 1.5 px ring slice */
+      -webkit-mask: radial-gradient(transparent 42.5px, #000 43px, #000 44.5px, transparent 45px);
+      mask:         radial-gradient(transparent 42.5px, #000 43px, #000 44.5px, transparent 45px);
+      animation: spin 9s linear infinite;
+      filter: drop-shadow(0 0 2.5px rgba(252,218,62,0.90));
+      pointer-events: none;
+    }
+
+    /* Ghost counter-arc (white, very faint) */
+    #arc2 {
+      position: absolute;
+      width: 90px;
+      height: 90px;
+      border-radius: 50%;
+      background: conic-gradient(
+        from 195deg,
+        transparent  0deg,
+        transparent  72deg,
+        rgba(255,255,255,0.14)  84deg,
+        rgba(255,255,255,0.26)  96deg,
+        rgba(255,255,255,0.14) 108deg,
+        transparent  120deg,
+        transparent  360deg
+      );
+      -webkit-mask: radial-gradient(transparent 42.5px, #000 43px, #000 44.5px, transparent 45px);
+      mask:         radial-gradient(transparent 42.5px, #000 43px, #000 44.5px, transparent 45px);
+      animation: spin-r 14s linear infinite;
+      pointer-events: none;
+    }
+
+    /* ── Crisp static border ring ── */
+    #ring {
+      position: absolute;
+      width: 82px;
+      height: 82px;
+      border-radius: 50%;
+      /* crisp 1.5 px solid line — not diffuse */
+      border: 1.5px solid rgba(235,195,55,0.60);
+      box-shadow:
+        0 0  5px rgba(235,195,55,0.55),
+        0 0 12px rgba(212,168,42,0.28),
+        inset 0 0  5px rgba(235,195,55,0.06);
+      pointer-events: none;
+    }
+
+    /* ── FLAT dark interior — no 3-D gradient ── */
+    #face {
+      position: absolute;
+      width: 72px;
+      height: 72px;
+      border-radius: 50%;
+      /* Flat dark — avoids the "bowling ball" effect */
+      background: #09080400;
+      background-color: #09070300;
+      /* Subtle very-low-contrast inner shadow for a shallow recess feel */
+      background: #0a0803;
+      box-shadow: inset 0 0 12px rgba(0,0,0,0.88);
+      cursor: pointer;
+      overflow: hidden;
+    }
+
+    /* ── Centre: 3-line waveform icon ── */
+    #icon {
+      position: absolute;
+      display: flex;
+      flex-direction: column;
+      align-items: center;
+      gap: 5px;
+      pointer-events: none;
+    }
+    .ibar {
+      border-radius: 1px;
+      background: rgba(248,218,62,0.72);
+      height: 1.5px;
+      animation: ibar-breathe 3.4s ease-in-out infinite;
+    }
+    .ibar.b1 { width: 24px; animation-delay: 0.00s; }
+    .ibar.b2 { width: 34px; animation-delay: 0.18s; }
+    .ibar.b3 { width: 24px; animation-delay: 0.09s; }
+
+    /* ── 3×3 dot grid (floating right) ── */
+    #dot-grid {
+      position: absolute;
+      right: 2px;
+      top: 12px;
+      display: grid;
+      grid-template-columns: repeat(3, 4px);
+      gap: 3px;
+      pointer-events: none;
+    }
+    #dot-grid span {
+      display: block;
+      width: 2.5px;
+      height: 2.5px;
+      border-radius: 50%;
+      background: rgba(212,168,42,0.35);
+    }
+
+    /* ════════  BASE KEYFRAMES  ════════ */
+
+    @keyframes spin   { to { transform: rotate( 360deg); } }
+    @keyframes spin-r { to { transform: rotate(-360deg); } }
+
+    @keyframes ibar-breathe {
+      0%, 100% { opacity: 0.45; transform: scaleX(1);    }
+      50%       { opacity: 0.80; transform: scaleX(1.12); }
+    }
+    @keyframes ibar-wave {
+      0%   { opacity: 0.85; transform: scaleX(0.55); }
+      50%  { opacity: 1.00; transform: scaleX(1.45); }
+      100% { opacity: 0.85; transform: scaleX(0.55); }
+    }
+    @keyframes ring-pulse-speak {
+      0%, 100% {
+        border-color: rgba(252,218,62,0.75);
+        box-shadow: 0 0  7px rgba(252,218,62,0.65), 0 0 16px rgba(212,168,42,0.36);
+      }
+      50% {
+        border-color: rgba(255,232,80,1.00);
+        box-shadow: 0 0 12px rgba(255,232,80,0.95), 0 0 28px rgba(232,185,48,0.60);
+      }
+    }
+    @keyframes ring-pulse-listen {
+      0%, 100% {
+        border-color: rgba(235,230,200,0.55);
+        box-shadow: 0 0 7px rgba(245,240,210,0.45), 0 0 16px rgba(235,225,185,0.22);
+      }
+      50% {
+        border-color: rgba(255,255,230,0.80);
+        box-shadow: 0 0 11px rgba(255,255,220,0.75), 0 0 24px rgba(245,235,195,0.38);
+      }
+    }
+
+    /* ── Status badge (shown during async tool fetches) ── */
+    #nova-status-badge {
+      position: absolute;
+      bottom: 4px;
+      left: 50%;
+      transform: translateX(-50%);
+      font-family: 'Segoe UI', system-ui, sans-serif;
+      font-size: 9px;
+      font-weight: 600;
+      color: rgba(0, 245, 210, 1.0);
+      background: rgba(3, 10, 22, 0.92);
+      border: 1px solid rgba(0, 200, 175, 0.45);
+      border-radius: 20px;
+      padding: 3px 9px 3px 6px;
+      white-space: nowrap;
+      pointer-events: none;
+      display: none;
+      align-items: center;
+      gap: 5px;
+      letter-spacing: 0.35px;
+      z-index: 10;
+      backdrop-filter: blur(10px);
+      -webkit-backdrop-filter: blur(10px);
+      box-shadow:
+        0 2px 16px rgba(0, 0, 0, 0.70),
+        0 0 10px rgba(0, 200, 175, 0.12),
+        inset 0 1px 0 rgba(255, 255, 255, 0.05);
+      animation: badge-in 0.22s cubic-bezier(0.34, 1.56, 0.64, 1) both;
+    }
+    /* Animated dot indicator */
+    #nova-status-badge::before {
+      content: '';
+      display: inline-block;
+      width: 5px;
+      height: 5px;
+      border-radius: 50%;
+      background: rgba(0, 245, 210, 0.95);
+      box-shadow: 0 0 6px rgba(0, 245, 210, 0.8);
+      flex-shrink: 0;
+      animation: dot-breathe 1.0s ease-in-out infinite;
+    }
+    @keyframes badge-in {
+      from { opacity: 0; transform: translateX(-50%) translateY(4px) scale(0.92); }
+      to   { opacity: 1; transform: translateX(-50%) translateY(0)   scale(1.00); }
+    }
+    @keyframes dot-breathe {
+      0%, 100% { opacity: 1;    transform: scale(1.0); }
+      50%       { opacity: 0.35; transform: scale(0.65); }
+    }
+
+    /* ════════  STATE OVERRIDES  ════════ */
+
+    /* -- LISTENING -- */
+    #widget.listening #arc {
+      background: conic-gradient(
+        from 0deg,
+        transparent  0deg, transparent 62deg,
+        rgba(235,230,190,0.55) 78deg, rgba(255,255,215,1) 108deg,
+        rgba(235,230,190,0.55) 124deg, transparent 140deg, transparent 360deg
+      );
+      animation-duration: 5s;
+      filter: drop-shadow(0 0 2.5px rgba(255,255,200,0.80));
+    }
+    #widget.listening #ring  { animation: ring-pulse-listen 1.6s ease-in-out infinite; }
+    #widget.listening .ibar  { background: rgba(255,255,210,0.80); animation-duration: 1.8s; }
+
+    /* -- SPEAKING -- */
+    #widget.speaking #arc    { animation-duration: 1.3s; filter: drop-shadow(0 0 4px rgba(252,218,62,1.00)); }
+    #widget.speaking #arc2   { animation-duration: 0.85s; }
+    #widget.speaking #ring   { animation: ring-pulse-speak 0.50s ease-in-out infinite; }
+    #widget.speaking .ibar   {
+      background: rgba(252,218,62,0.96);
+      animation: ibar-wave 0.44s ease-in-out infinite;
+    }
+    #widget.speaking .ibar.b1 { animation-delay: 0.00s; }
+    #widget.speaking .ibar.b2 { animation-delay: 0.09s; }
+    #widget.speaking .ibar.b3 { animation-delay: 0.04s; }
+
+    /* -- THINKING -- */
+    #widget.thinking #arc    { animation-duration: 20s; opacity: 0.50; }
+    #widget.thinking #arc2   { opacity: 0.25; }
+    #widget.thinking #ring   {
+      border-color: rgba(212,168,42,0.30);
+      box-shadow: 0 0 5px rgba(212,168,42,0.20);
+    }
+    #widget.thinking .ibar   { animation-duration: 1.2s; opacity: 0.40; }
+
+    /* -- RECORDING (macro capture active) -- */
+    #widget.recording {
+      box-shadow: 0 0 18px 4px rgba(255, 60, 60, 0.7);
+      animation: recording-pulse 1.2s ease-in-out infinite alternate;
+    }
+    @keyframes recording-pulse {
+      from { box-shadow: 0 0 12px 2px rgba(255,60,60,0.5); }
+      to   { box-shadow: 0 0 24px 8px rgba(255,60,60,0.9); }
+    }
+
+    /* -- GENERATING IMAGE -- purple/magenta creative pulse */
+    #widget.generating #arc  {
+      background: conic-gradient(
+        from 0deg,
+        transparent 0deg, transparent 40deg,
+        rgba(200,100,255,0.45) 70deg, rgba(230,80,255,1) 108deg,
+        rgba(200,100,255,0.45) 140deg, transparent 170deg, transparent 360deg
+      );
+      animation-duration: 2.2s;
+      filter: drop-shadow(0 0 5px rgba(200,80,255,0.90));
+    }
+    #widget.generating #arc2 { animation-duration: 1.4s; opacity: 0.60; }
+    #widget.generating #ring {
+      border-color: rgba(190,80,255,0.55);
+      box-shadow: 0 0 10px rgba(190,80,255,0.40), 0 0 22px rgba(190,80,255,0.18);
+      animation: ring-pulse-gen 1.2s ease-in-out infinite;
+    }
+    #widget.generating .ibar {
+      background: rgba(210,90,255,0.90);
+      animation-duration: 0.9s;
+    }
+    @keyframes ring-pulse-gen {
+      0%,100% { box-shadow: 0 0 8px rgba(190,80,255,0.40), 0 0 20px rgba(190,80,255,0.18); }
+      50%      { box-shadow: 0 0 16px rgba(210,80,255,0.70), 0 0 36px rgba(210,80,255,0.30); }
+    }
+    /* dot in badge turns magenta during image gen */
+    #nova-status-badge.image-gen::before {
+      background: rgba(210,90,255,0.95);
+      box-shadow: 0 0 6px rgba(210,90,255,0.8);
+    }
+    #nova-status-badge.image-gen {
+      color: rgba(220,120,255,1.0);
+      border-color: rgba(190,80,255,0.50);
+    }
+  </style>
+</head>
+<body>
+  <div id="widget" class="offline">
+    <div id="arc"></div>
+    <div id="arc2"></div>
+    <div id="ring"></div>
+    <div id="face"></div>
+    <div id="icon">
+      <div class="ibar b1"></div>
+      <div class="ibar b2"></div>
+      <div class="ibar b3"></div>
+    </div>
+    <div id="dot-grid">
+      <span></span><span></span><span></span>
+      <span></span><span></span><span></span>
+      <span></span><span></span><span></span>
+    </div>
+    <div id="nova-status-badge"></div>
+  </div>
+
+  <script src="./node_modules/vosk-browser/dist/vosk.js"></script>
+  <script type="module" src="renderer.js"></script>
+</body>
+</html>

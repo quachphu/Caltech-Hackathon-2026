@@ -1,0 +1,87 @@
+<!DOCTYPE html>
+<html>
+<head>
+  <meta charset="UTF-8" />
+  <title>Comms Channel</title>
+  <style>
+    body {
+      margin: 0;
+      padding: 0;
+      background: #111;
+      color: #0ff;
+      font-family: 'Courier New', Courier, monospace;
+      display: flex;
+      flex-direction: column;
+      height: 100vh;
+      overflow: hidden;
+    }
+    #messages {
+      flex: 1;
+      padding: 10px;
+      
+      overflow-y: auto;
+      display: flex;
+      flex-direction: column;
+      gap: 10px;
+      font-size: 14px;
+    }
+    .msg {
+      padding: 8px 12px;
+      border-radius: 4px;
+      max-width: 80%;
+      word-wrap: break-word;
+    }
+    .msg.user {
+      align-self: flex-end;
+      background: #004444;
+      border: 1px solid #0aa;
+    }
+    .msg.bot {
+      align-self: flex-start;
+      background: #222;
+      border: 1px solid #0ff;
+      color: #8ff;
+    }
+    #input-container {
+      display: flex;
+      border-top: 1px solid #0ff;
+      background: #000;
+      padding: 10px;
+    }
+    #chat-input {
+      flex: 1;
+      background: transparent;
+      border: none;
+      color: #0ff;
+      font-family: inherit;
+      font-size: 14px;
+      outline: none;
+    }
+    #send-btn {
+      background: transparent;
+      color: #0ff;
+      border: 1px solid #0ff;
+      padding: 5px 15px;
+      cursor: pointer;
+      font-family: inherit;
+      text-transform: uppercase;
+      transition: 0.2s;
+    }
+    #send-btn:hover {
+      background: #0ff;
+      color: #000;
+    }
+  </style>
+</head>
+<body>
+  <div id="messages">
+    <div class="msg bot">Comms channel opened. How can I assist you?</div>
+  </div>
+  <div id="input-container">
+    <input type="text" id="chat-input" placeholder="Enter command..." autocomplete="off" />
+    <button id="send-btn">Send</button>
+  </div>
+  <script src="chat.js"></script>
+</body>
+</html>
+
