@@ -8,6 +8,16 @@ Nova is an **AI agent** that learns and executes workflows across any software o
 
 ---
 
+## Links
+
+| Resource                            | URL                                                                                    |
+| ----------------------------------- | -------------------------------------------------------------------------------------- |
+| **Website**                         | <https://novatechai.tech/>                                                             |
+| **User survey & interview (video)** | <https://drive.google.com/drive/folders/1NNDNxvJNhKSiK3H5IQRu4VVMeUfwyzjj?usp=sharing> |
+| **Slide deck**                      | <https://canva.link/r1t51is1wwdz4qe>                                                   |
+
+---
+
 ## Architecture
 
 Nova ships as an **Electron** app: a compact voice UI, a main process for OS access, and **Google Gemini Live** for real-time speech, tool use, and voice output.
@@ -45,18 +55,6 @@ flowchart TB
 | **Main**                 | Security-sensitive work: file paths, process launch, windowing, and the bridge to [Gemini Live](https://ai.google.dev/) in the main process. |
 | **Gemini Live**          | End-to-end voice: intent, **tool calls** into desktop, browser, and Google-integrated features, then spoken replies.                         |
 | **Backboard** (optional) | Long-term **memory** and **semantic recall** so user context persists across sessions.                                                       |
-
-_File-level structure, API invariants, and debugging: [DEVELOPERS.md](DEVELOPERS.md)._
-
----
-
-## Links
-
-| Resource                            | URL                                                                                    |
-| ----------------------------------- | -------------------------------------------------------------------------------------- |
-| **Website**                         | <https://novatechai.tech/>                                                             |
-| **User survey & interview (video)** | <https://drive.google.com/drive/folders/1NNDNxvJNhKSiK3H5IQRu4VVMeUfwyzjj?usp=sharing> |
-| **Slide deck**                      | <https://canva.link/r1t51is1wwdz4qe>                                                   |
 
 ---
 
