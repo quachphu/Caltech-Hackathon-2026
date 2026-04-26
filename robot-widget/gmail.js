@@ -1,5 +1,7 @@
 'use strict';
 require('dotenv').config();
+const fs              = require('fs');
+const path            = require('path');
 const { google }      = require('googleapis');
 const { GoogleGenAI } = require('@google/genai');
 const { getAuthClient, isAuthenticated } = require('./google_auth');
@@ -338,16 +340,68 @@ async function generateEmailContent(recipientName, subjectHint, messageIntent) {
     return { subject: subjectHint || '(no subject)', body: messageIntent };
 }
 
-function buildRawMime({ to, subject, body }) {
+function getMimeType(filename) {
+    const ext = path.extname(filename).toLowerCase();
+    const map = {
+        '.mp4': 'video/mp4', '.mov': 'video/quicktime', '.avi': 'video/x-msvideo',
+        '.mkv': 'video/x-matroska', '.webm': 'video/webm', '.m4v': 'video/x-m4v',
+        '.pdf': 'application/pdf',
+        '.doc': 'application/msword',
+        '.docx': 'application/vnd.openxmlformats-officedocument.wordprocessingml.document',
+        '.xls': 'application/vnd.ms-excel',
+        '.xlsx': 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet',
+        '.ppt': 'application/vnd.ms-powerpoint',
+        '.pptx': 'application/vnd.openxmlformats-officedocument.presentationml.presentation',
+        '.txt': 'text/plain', '.odt': 'application/vnd.oasis.opendocument.text',
+        '.jpg': 'image/jpeg', '.jpeg': 'image/jpeg', '.png': 'image/png',
+        '.gif': 'image/gif', '.webp': 'image/webp', '.bmp': 'image/bmp',
+    };
+    return map[ext] || 'application/octet-stream';
+}
+
+function buildRawMime({ to, subject, body, attachmentPath }) {
+    if (!attachmentPath) {
+        const headers = [
+            `To: ${to}`,
+            `Subject: =?UTF-8?B?${Buffer.from(subject).toString('base64')}?=`,
+            'MIME-Version: 1.0',
+            'Content-Type: text/plain; charset=UTF-8',
+            'Content-Transfer-Encoding: base64',
+        ].join('\r\n');
+        const raw = `${headers}\r\n\r\n${Buffer.from(body).toString('base64')}`;
+        return Buffer.from(raw).toString('base64').replace(/\+/g, '-').replace(/\//g, '_').replace(/=+$/, '');
+    }
+
+    const boundary = `nova_${Date.now()}`;
+    const fileName = path.basename(attachmentPath);
+    const fileData = fs.readFileSync(attachmentPath).toString('base64');
+    const fileMime = getMimeType(fileName);
+
+    const multipart = [
+        `--${boundary}`,
+        'Content-Type: text/plain; charset=UTF-8',
+        'Content-Transfer-Encoding: base64',
+        '',
+        Buffer.from(body).toString('base64'),
+        '',
+        `--${boundary}`,
+        `Content-Type: ${fileMime}; name="${fileName}"`,
+        'Content-Transfer-Encoding: base64',
+        `Content-Disposition: attachment; filename="${fileName}"`,
+        '',
+        fileData,
+        '',
+        `--${boundary}--`,
+    ].join('\r\n');
+
     const headers = [
         `To: ${to}`,
         `Subject: =?UTF-8?B?${Buffer.from(subject).toString('base64')}?=`,
         'MIME-Version: 1.0',
-        'Content-Type: text/plain; charset=UTF-8',
-        'Content-Transfer-Encoding: base64',
+        `Content-Type: multipart/mixed; boundary="${boundary}"`,
     ].join('\r\n');
 
-    const raw = `${headers}\r\n\r\n${Buffer.from(body).toString('base64')}`;
+    const raw = `${headers}\r\n\r\n${multipart}`;
     return Buffer.from(raw).toString('base64').replace(/\+/g, '-').replace(/\//g, '_').replace(/=+$/, '');
 }
 
@@ -356,12 +410,12 @@ function buildRawMime({ to, subject, body }) {
  * @param {{ to: string, subject: string, body: string }}
  * @returns {{ success: boolean, messageId?: string, error?: string }}
  */
-async function sendEmail({ to, subject, body }) {
+async function sendEmail({ to, subject, body, attachmentPath }) {
     try {
         const gmail    = await getGmailClient();
         const response = await gmail.users.messages.send({
             userId: 'me',
-            requestBody: { raw: buildRawMime({ to, subject, body }) },
+            requestBody: { raw: buildRawMime({ to, subject, body, attachmentPath }) },
         });
         console.log('[Gmail] Email sent — messageId:', response.data.id);
         return { success: true, messageId: response.data.id };
@@ -376,12 +430,12 @@ async function sendEmail({ to, subject, body }) {
  * @param {{ to: string, subject: string, body: string }}
  * @returns {{ success: boolean, draftId?: string, error?: string }}
  */
-async function draftEmail({ to, subject, body }) {
+async function draftEmail({ to, subject, body, attachmentPath }) {
     try {
         const gmail    = await getGmailClient();
         const response = await gmail.users.drafts.create({
             userId: 'me',
-            requestBody: { message: { raw: buildRawMime({ to, subject, body }) } },
+            requestBody: { message: { raw: buildRawMime({ to, subject, body, attachmentPath }) } },
         });
         console.log('[Gmail] Draft saved — draftId:', response.data.id);
         return { success: true, draftId: response.data.id };
@@ -428,6 +482,8 @@ async function handleSendEmailTool(
         recipient_email = null,
         confirmed       = false,
         selected_index  = null,
+        attachment_path = null,
+        confirmed_body  = null,
     },
     speakFn,
     logFn
@@ -567,11 +623,29 @@ async function handleSendEmailTool(
             }
             confirmSubject = confirmSubject || 'Nova Update';
 
-            const verb    = draft_only ? 'save a draft' : 'send an email';
-            const confirm = draft_only ? 'save the draft' : 'send it';
+            // Generate the body draft now so the user can hear and confirm it before sending
+            log(`📧 Generating body preview for confirmation...`);
+            let bodyDraft = '';
+            try {
+                const generated = await generateEmailContent(resolvedName, confirmSubject, message_intent);
+                bodyDraft = generated.body || '';
+            } catch (_) { bodyDraft = ''; }
+
+            const verb    = draft_only ? 'save a draft' : 'send';
+            const attachNote = attachment_path
+                ? ` with attachment "${path.basename(attachment_path)}"`
+                : '';
+            // Truncate body preview to ~80 words for TTS readability
+            const bodyWords = bodyDraft.split(/\s+/);
+            const bodyPreview = bodyWords.length > 80
+                ? bodyWords.slice(0, 80).join(' ') + '...'
+                : bodyDraft;
+
             const msg =
-                `I'll ${verb} to ${resolvedName} at ${resolvedEmail}, ` +
-                `subject: "${confirmSubject}". Should I ${confirm}?`;
+                `Here's the plan: I'll ${verb} to ${resolvedName}${attachNote}. ` +
+                `Subject: "${confirmSubject}". ` +
+                `Email body: "${bodyPreview}". ` +
+                `Does this sound good? Say yes to send it.`;
             return {
                 status:            'needs_confirmation',
                 speak:             msg,
@@ -579,22 +653,36 @@ async function handleSendEmailTool(
                 recipient_email:   resolvedEmail,
                 recipient_display: resolvedName,
                 confirmed_subject: confirmSubject,
+                confirmed_body:    bodyDraft,
+                attachment_path:   attachment_path || null,
             };
         }
 
         // ── SEND / DRAFT ───────────────────────────────────────────────────────
-        log(`📧 Generating body for ${resolvedEmail}...`);
-        const { subject: generatedSubject, body } = await generateEmailContent(
-            resolvedName,
-            subject,
-            message_intent
-        );
-        const finalSubject = subject || generatedSubject;
+        // Use pre-confirmed body if available (generated at confirmation step), else generate now
+        let finalBody = confirmed_body || null;
+        let finalSubject = subject || null;
+        if (!finalBody || !finalSubject) {
+            log(`📧 Generating body for ${resolvedEmail}...`);
+            const { subject: generatedSubject, body: generatedBody } = await generateEmailContent(
+                resolvedName,
+                subject,
+                message_intent
+            );
+            if (!finalBody)    finalBody    = generatedBody;
+            if (!finalSubject) finalSubject = generatedSubject;
+        }
 
-        log(`📧 ${draft_only ? 'Drafting' : 'Sending'} to ${resolvedEmail} — "${finalSubject}"`);
+        if (attachment_path && !fs.existsSync(attachment_path)) {
+            const errMsg = `I couldn't find the attachment file: ${path.basename(attachment_path)}`;
+            log(`❌ ${errMsg}`);
+            return { status: 'error', speak: errMsg, message: errMsg };
+        }
+        const body = finalBody;
+        log(`📧 ${draft_only ? 'Drafting' : 'Sending'} to ${resolvedEmail} — "${finalSubject}"${attachment_path ? ` + ${path.basename(attachment_path)}` : ''}`);
         const result = draft_only
-            ? await draftEmail({ to: resolvedEmail, subject: finalSubject, body })
-            : await sendEmail({ to: resolvedEmail, subject: finalSubject, body });
+            ? await draftEmail({ to: resolvedEmail, subject: finalSubject, body, attachmentPath: attachment_path })
+            : await sendEmail({ to: resolvedEmail, subject: finalSubject, body, attachmentPath: attachment_path });
 
         if (!result.success) {
             const errMsg =

@@ -8,6 +8,7 @@ const crypto = require('crypto');
 let _videoEditorModeActive = false;
 let _editorOpening        = false;
 let _currentProjectPath   = null;  // tracks the active .osp file for direct editing
+let _openShotKilled       = false; // true when we killed OpenShot to edit .osp; relaunch before next GUI action
 const _veDebounce = new Map();
 const VE_DEBOUNCE_MS = {
     open_editor:     8000,
@@ -15,8 +16,9 @@ const VE_DEBOUNCE_MS = {
     import_file:     12000,
     add_to_timeline: 3000,
     delete_clip:     3000,
-    play_preview:    2000,
-    stop_preview:    2000,
+    play_preview:    30000,
+    stop_preview:    5000,
+    close_preview:   5000,
     save_project:    5000,
     export_video:    10000,
     undo:            2000,
@@ -34,11 +36,43 @@ function getVideosDir() {
     return path.join(os.homedir(), 'Videos'); // Linux + Windows
 }
 
+// Human-readable folder name for spoken responses
+function getVideosFolderName() {
+    return process.platform === 'darwin' ? 'Movies' : 'Videos';
+}
+
+// Open a file with the system default application (cross-platform)
+function openWithSystemPlayer(filePath) {
+    const safe = filePath.replace(/'/g, "'\\''");
+    if (process.platform === 'darwin') {
+        exec(`open '${safe}'`);
+    } else if (process.platform === 'win32') {
+        // Windows: use start with an empty title so paths with spaces work
+        exec(`start "" "${filePath.replace(/"/g, '\\"')}"`);
+    } else {
+        exec(`xdg-open '${safe}' 2>/dev/null`);
+    }
+}
+
 function expandVideoPath(fileName) {
     if (!fileName) return fileName;
-    // If the user gave a bare filename (no dir), default to the Videos folder
+    const videosDir = getVideosDir();
     if (!fileName.includes('/') && !fileName.includes('\\')) {
-        return path.join(getVideosDir(), fileName);
+        const exact = path.join(videosDir, fileName);
+        if (fs.existsSync(exact)) return exact;
+        // Case-insensitive fallback: find the file whose name best matches
+        if (fs.existsSync(videosDir)) {
+            const lowerFn = fileName.toLowerCase();
+            const files = fs.readdirSync(videosDir);
+            // Exact case-insensitive match first
+            const ciMatch = files.find(f => f.toLowerCase() === lowerFn);
+            if (ciMatch) return path.join(videosDir, ciMatch);
+            // Fuzzy: strip extension and find closest stem match
+            const stem = lowerFn.replace(/\.[^.]+$/, '');
+            const fuzzy = files.find(f => f.toLowerCase().replace(/\.[^.]+$/, '') === stem);
+            if (fuzzy) return path.join(videosDir, fuzzy);
+        }
+        return exact; // return original so error message shows what was looked for
     }
     return fileName;
 }
@@ -125,6 +159,31 @@ function listOspProjects() {
         .map(f => f.replace(/\.osp$/i, ''));
 }
 
+// Returns video files from the Videos folder that are NOT currently on the timeline.
+// Used to build accurate "remaining files" lists for CLIP_ADDED injections.
+function getRemainingVideoFiles(ospPath) {
+    const videoExts = ['.mp4', '.mkv', '.avi', '.mov', '.webm', '.wmv', '.flv', '.m4v'];
+    const videosDir = getVideosDir();
+    let allVids = [];
+    try {
+        if (fs.existsSync(videosDir))
+            allVids = fs.readdirSync(videosDir).filter(f => videoExts.some(e => f.toLowerCase().endsWith(e)) && !f.toLowerCase().includes('_movie'));
+    } catch {}
+
+    if (!ospPath || !fs.existsSync(ospPath)) return allVids;
+
+    try {
+        const proj = readOsp(ospPath);
+        const clipsOnTimeline = new Set((proj.clips || []).map(c => c.file_id));
+        const onTimelineNames = new Set(
+            (proj.files || [])
+                .filter(f => clipsOnTimeline.has(f.id))
+                .map(f => f.name || path.basename(f.path || ''))
+        );
+        return allVids.filter(f => !onTimelineNames.has(f));
+    } catch { return allVids; }
+}
+
 // ── .osp direct-editing helpers ───────────────────────────────────────────
 
 function readOsp(ospPath) {
@@ -193,7 +252,7 @@ function buildFileEntry(filePath, meta) {
         fps: { num: meta.video_fps_num, den: meta.video_fps_den },
         pixel_ratio: { num: 1, den: 1 },
         display_ratio: { num: meta.width, den: meta.height > 0 ? meta.height : 1 },
-        tags: [],
+        tags: "",  // OpenShot expects string, not list — [] crashes QStandardItem in files_model.py
         file_size: '',
         acodec: meta.has_audio ? 'aac' : '',
         vcodec: meta.has_video ? 'h264' : '',
@@ -239,12 +298,18 @@ function buildClipEntry(fileEntry, position, layerNumber) {
 
 // Import a video into the .osp project file directly (no GUI needed)
 async function importFileIntoOsp(ospPath, videoPath, logFn) {
+    const proj = readOsp(ospPath);
+
+    // REUSE existing entry if file is already in project — preserves file_id so existing clips stay valid
+    const existing = (proj.files || []).find(f => f.path === videoPath);
+    if (existing) {
+        logFn(`🎬 File already in project (reusing id): ${path.basename(videoPath)}`);
+        return existing;
+    }
+
     const meta  = await getVideoMetadata(videoPath);
     const entry = buildFileEntry(videoPath, meta);
-    const proj  = readOsp(ospPath);
-
-    // Remove any existing entry for the same path
-    proj.files = (proj.files || []).filter(f => f.path !== videoPath);
+    proj.files = (proj.files || []);
     proj.files.push(entry);
     writeOsp(ospPath, proj);
 
@@ -253,19 +318,50 @@ async function importFileIntoOsp(ospPath, videoPath, logFn) {
 }
 
 // Add a clip to the timeline in the .osp project file
-function addClipToOspTimeline(ospPath, fileId, logFn) {
+// Use libopenshot (via flatpak) to generate a 100% compatible clip JSON
+function buildClipViaLibopenshot(filePath, position, layer, fileId, duration) {
+    return new Promise((resolve, reject) => {
+        const scriptPath = path.join(__dirname, 'clip_gen.py');
+        const safe = filePath.replace(/'/g, "'\\''");
+        exec(
+            `flatpak run --command=python3 org.openshot.OpenShot '${scriptPath}' '${safe}' ${position} ${layer} '${fileId}' ${duration} 2>/dev/null`,
+            { timeout: 15000 },
+            (err, stdout) => {
+                if (err || !stdout.trim()) {
+                    reject(new Error(`clip_gen failed: ${err ? err.message : 'no output'}`));
+                    return;
+                }
+                try { resolve(JSON.parse(stdout.trim())); }
+                catch (e) { reject(new Error('clip_gen output not valid JSON')); }
+            }
+        );
+    });
+}
+
+async function addClipToOspTimeline(ospPath, fileId, logFn) {
     const proj = readOsp(ospPath);
 
     // Find the file entry
     const fileEntry = (proj.files || []).find(f => f.id === fileId);
     if (!fileEntry) throw new Error('File not found in project');
 
-    // Calculate position: end of last clip on layer 1000000
-    const existingClips = (proj.clips || []).filter(c => c.layer === 1000000);
+    // Resolve relative paths (OpenShot stores paths like './video.mp4') to absolute.
+    // libopenshot resolves from the Node process CWD, not the ${getVideosFolderName()} folder.
+    const ospDir = path.dirname(ospPath);
+    const videoPath = path.isAbsolute(fileEntry.path)
+        ? fileEntry.path
+        : path.resolve(ospDir, fileEntry.path);
+
+    // Use layer 5000000 (Track 5 = the top visible track in OpenShot's default view)
+    const TARGET_LAYER = 5000000;
+    const existingClips = (proj.clips || []).filter(c => c.layer === TARGET_LAYER);
     const lastEnd = existingClips.reduce((max, c) => Math.max(max, (c.position || 0) + (c.end || 0)), 0);
     const position = lastEnd;
+    const duration = fileEntry.duration || 30;
 
-    const clip = buildClipEntry(fileEntry, position, 1000000);
+    logFn(`🎬 Generating clip via libopenshot at position ${position.toFixed(1)}s (path: ${videoPath})...`);
+    const clip = await buildClipViaLibopenshot(videoPath, position, TARGET_LAYER, fileId, duration);
+
     proj.clips = (proj.clips || []);
     proj.clips.push(clip);
     writeOsp(ospPath, proj);
@@ -446,15 +542,19 @@ function typeTextToActive(text) {
 }
 
 async function handleVideoEditorTool(args, logFn) {
-    const { action, file_name, instruction } = args;
+    const { action, file_name, instruction, confirmed } = args;
     logFn(`🎬 [VideoEditor] action="${action}" file="${file_name || ''}" instruction="${instruction || ''}"`);
 
     const now = Date.now();
     const cooldown = VE_DEBOUNCE_MS[action] || 3000;
-    if (now - (_veDebounce.get(action) || 0) < cooldown) {
+    // Per-filename debounce for file actions — allows League1 and League2 to run concurrently
+    const _deKey = (action === 'import_file' || action === 'add_to_timeline' || action === 'delete_clip') && file_name
+        ? `${action}:${file_name.toLowerCase().replace(/\.[^.]+$/, '').trim()}`
+        : action;
+    if (now - (_veDebounce.get(_deKey) || 0) < cooldown) {
         return { status: 'debounced', speak: 'Already on it, just a moment.' };
     }
-    _veDebounce.set(action, now);
+    _veDebounce.set(_deKey, now);
 
     const hasXdotool = process.platform === 'linux' ? await checkXdotool() : false;
     const canAutomate = hasXdotool || process.platform !== 'linux';
@@ -467,14 +567,14 @@ async function handleVideoEditorTool(args, logFn) {
                 return {
                     status: 'ok',
                     projects: [],
-                    speak: "You don't have any saved projects in your Videos folder yet. Just tell me a name and I'll create a fresh one."
+                    speak: `You don't have any saved projects in your ${getVideosFolderName()} folder yet. Just tell me a name and I'll create a fresh one.`
                 };
             }
             const list = projects.slice(0, 10).join(', ');
             return {
                 status: 'ok',
                 projects,
-                speak: `Found ${projects.length} project${projects.length > 1 ? 's' : ''} in your Videos folder: ${list}. Which one would you like to open?`
+                speak: `Found ${projects.length} project${projects.length > 1 ? 's' : ''} in your ${getVideosFolderName()} folder: ${list}. Which one would you like to open?`
             };
         }
 
@@ -504,6 +604,25 @@ async function handleVideoEditorTool(args, logFn) {
                     if (projectPath) {
                         projectStatus = 'opened_existing';
                         logFn(`🎬 Found existing project: ${projectPath}`);
+                        // Clear timeline clips and normalize all file paths to absolute.
+                        // OpenShot stores relative paths (./video.mp4) which libopenshot
+                        // can't resolve from the Node process CWD — must be absolute.
+                        try {
+                            const ospDir2 = path.dirname(projectPath);
+                            const p = readOsp(projectPath);
+                            p.clips = [];
+                            p.files = (p.files || []).map(f => {
+                                if (f.path && !path.isAbsolute(f.path)) {
+                                    const abs = path.resolve(ospDir2, f.path);
+                                    return { ...f, path: abs, reader: { ...f.reader, path: abs } };
+                                }
+                                return f;
+                            });
+                            writeOsp(projectPath, p);
+                            logFn('🎬 Cleared timeline clips, normalized file paths — fresh session starts at 0s');
+                        } catch (e) {
+                            logFn(`🎬 Warning: could not reset project: ${e.message}`);
+                        }
                     } else {
                         // Not found — create a new one with this name
                         projectPath   = path.join(videosDir, `${projectName}.osp`);
@@ -548,15 +667,27 @@ async function handleVideoEditorTool(args, logFn) {
             _currentProjectPath = projectPath; // track for direct .osp editing
             logFn(`🎬 OpenShot launched (project: ${projectPath})`);
 
-            // Scan the Videos folder so Nova can immediately tell the user what's available
+            // Bring OpenShot to foreground (focus only — no keystrokes, no input stealing)
+            if (process.platform === 'linux') {
+                setTimeout(() => {
+                    exec(
+                        'WID=$(xdotool search --onlyvisible --name "OpenShot" 2>/dev/null | head -1); ' +
+                        '[ -z "$WID" ] && WID=$(xdotool search --onlyvisible --class "openshot" 2>/dev/null | head -1); ' +
+                        '[ -n "$WID" ] && xdotool windowactivate "$WID" 2>/dev/null; true',
+                        () => {}
+                    );
+                }, 4000); // give OpenShot 4s to fully load its window before activating
+            }
+
+            // Scan the ${getVideosFolderName()} folder so Nova can immediately tell the user what's available
             const videoExts  = ['.mp4', '.mkv', '.avi', '.mov', '.webm', '.wmv', '.flv', '.m4v'];
             const videoFiles = fs.existsSync(videosDir)
                 ? fs.readdirSync(videosDir).filter(f => videoExts.some(e => f.toLowerCase().endsWith(e)))
                 : [];
 
             const speak = projectStatus === 'opened_existing'
-                ? `OpenShot is open with your existing project "${projectName}" loaded from your Videos folder.`
-                : `OpenShot is open and your project "${projectName}" is saved to your Videos folder.`;
+                ? `OpenShot is open with your existing project "${projectName}" loaded from your ${getVideosFolderName()} folder.`
+                : `OpenShot is open and your project "${projectName}" is saved to your ${getVideosFolderName()} folder.`;
 
             return {
                 status:         'ok',
@@ -576,7 +707,7 @@ async function handleVideoEditorTool(args, logFn) {
             logFn(`🎬 create_project (legacy): ${pPath}`);
             return {
                 status: 'ok',
-                speak: `Your project "${projectName}" is saved to your Videos folder. What video files would you like to import?`
+                speak: `Your project "${projectName}" is saved to your ${getVideosFolderName()} folder. What video files would you like to import?`
             };
         }
 
@@ -590,42 +721,61 @@ async function handleVideoEditorTool(args, logFn) {
 
             const fn       = file_name || '';
             const fullPath = expandVideoPath(fn);
-            logFn(`🎬 Importing into .osp directly: ${fullPath}`);
+            logFn(`🎬 Adding to project and timeline: ${fullPath}`);
 
             if (!fs.existsSync(fullPath)) {
-                return { status: 'error', speak: `I couldn't find "${fn}" in your Videos folder. Please check the filename and try again.` };
+                return { status: 'error', speak: `I couldn't find "${fn}" in your ${getVideosFolderName()} folder. Please check the filename and try again.` };
             }
 
             try {
-                // Close OpenShot first so it doesn't overwrite our changes on exit
                 logFn('🎬 Closing OpenShot to edit project file...');
                 await killOpenShot();
-                await new Promise(r => setTimeout(r, 500));
 
-                // Edit the .osp file directly — no dialogs, no focus stealing
                 const entry = await importFileIntoOsp(_currentProjectPath, fullPath, logFn);
 
-                // Reopen OpenShot with the updated project
-                logFn('🎬 Reopening OpenShot with updated project...');
+                // Duplicate guard: if this file is already on the timeline don't add it again.
+                const projNow = readOsp(_currentProjectPath);
+                if ((projNow.clips || []).some(c => c.file_id === entry.id)) {
+                    logFn(`🎬 Duplicate blocked in import_file: ${path.basename(fullPath)} already on timeline`);
+                    launchOpenShot(_currentProjectPath);
+                    const name = path.basename(fullPath);
+                    return {
+                        status: 'ok', file_id: entry.id, file_name: name, clip_position: 0,
+                        speak: `"${name}" is already on your timeline. Say another filename to add, or say play to preview.`
+                    };
+                }
+
+                const clip  = await addClipToOspTimeline(_currentProjectPath, entry.id, logFn);
+
+                // Relaunch in background — don't await. Nova speaks the confirmation
+                // while OpenShot loads the updated timeline behind the scenes.
                 launchOpenShot(_currentProjectPath);
-                await new Promise(r => setTimeout(r, 800));
 
                 const name = path.basename(fullPath);
                 return {
                     status: 'ok',
                     file_id: entry.id,
-                    speak: `Done! I've added "${name}" to your project and reopened the editor. ` +
-                           `It should appear in the Project Files panel on the left. ` +
-                           `Would you like to import another video, or shall I add this one to the timeline?`
+                    file_name: name,
+                    clip_position: clip.position,
+                    remaining_files: getRemainingVideoFiles(_currentProjectPath),
+                    speak: `Done! "${name}" is on your timeline at ${clip.position.toFixed(1)} seconds.`
                 };
             } catch (e) {
                 logFn(`🎬 import_file error: ${e.message}`);
-                return { status: 'error', speak: `I had trouble importing the file: ${e.message.slice(0, 100)}` };
+                launchOpenShot(_currentProjectPath);
+                return { status: 'error', speak: `I had trouble with that file: ${e.message.slice(0, 100)}` };
             }
         }
 
         case 'add_to_timeline': {
-            if (!_videoEditorModeActive) return { status: 'error', speak: 'OpenShot is not open.' };
+            // If the editor is still launching (open_editor was called seconds ago), wait up to 8s for it.
+            if (!_videoEditorModeActive) {
+                for (let i = 0; i < 8; i++) {
+                    await new Promise(r => setTimeout(r, 1000));
+                    if (_videoEditorModeActive) break;
+                }
+            }
+            if (!_videoEditorModeActive) return { status: 'error', speak: 'OpenShot is not open. Say "help me edit a video" to start.' };
             if (!_currentProjectPath || !fs.existsSync(_currentProjectPath)) {
                 return { status: 'error', speak: 'I lost track of the project file. Please restart the video editor.' };
             }
@@ -634,101 +784,286 @@ async function handleVideoEditorTool(args, logFn) {
             logFn(`🎬 Adding to timeline via .osp edit: ${fn}`);
 
             try {
-                const proj = readOsp(_currentProjectPath);
+                // Kill OpenShot only if currently running — so we can safely write the .osp.
+                // After the edit we relaunch it immediately in the background (not awaited),
+                // so Nova responds instantly while OpenShot loads the updated timeline.
+                if (await isOpenShotRunning()) {
+                    await killOpenShot();
+                    // No wait — OpenShot exits within ms, proceed immediately.
+                }
+                _openShotKilled = true;
+
+                const lowerFn = fn.toLowerCase();
+                let proj = readOsp(_currentProjectPath);
 
                 // Find the file in the project (by name or path match)
-                const lowerFn = fn.toLowerCase().replace(/\.osp$/i, '');
-                const fileEntry = (proj.files || []).find(f =>
+                let fileEntry = (proj.files || []).find(f =>
                     f.name?.toLowerCase() === fn.toLowerCase() ||
                     f.path?.toLowerCase().includes(lowerFn) ||
                     path.basename(f.path || '').toLowerCase().includes(lowerFn)
                 );
 
+                // Auto-import the file if it's not already in the project
                 if (!fileEntry) {
+                    const fullPath = expandVideoPath(fn);
+                    if (!fs.existsSync(fullPath)) {
+                        const videoExts = ['.mp4', '.mkv', '.avi', '.mov', '.webm', '.wmv', '.flv', '.m4v'];
+                        const available = fs.existsSync(getVideosDir())
+                            ? fs.readdirSync(getVideosDir()).filter(f => videoExts.some(e => f.toLowerCase().endsWith(e)) && !f.toLowerCase().includes('_movie'))
+                            : [];
+                        const availStr = available.length ? ` Available: ${available.slice(0, 5).join(', ')}.` : '';
+                        return { status: 'error', speak: `I couldn't find "${fn}" in your ${getVideosFolderName()} folder.${availStr} Which file did you mean?` };
+                    }
+                    logFn(`🎬 File not in project yet — auto-importing: ${fullPath}`);
+                    fileEntry = await importFileIntoOsp(_currentProjectPath, fullPath, logFn);
+                }
+
+                // Duplicate guard: if this file is already on the timeline, don't add it again.
+                // This catches the case where import_file already added it and Gemini retries.
+                const alreadyOnTimeline = (readOsp(_currentProjectPath).clips || []).some(c => c.file_id === fileEntry.id);
+                if (alreadyOnTimeline) {
+                    logFn(`🎬 Duplicate blocked: ${fn} is already on the timeline`);
+                    launchOpenShot(_currentProjectPath);
+                    _openShotKilled = false;
+                    const name = fileEntry.name || fn;
                     return {
-                        status: 'error',
-                        speak: `I couldn't find "${fn}" in the project. Please import it first, then ask me to add it to the timeline.`
+                        status: 'ok',
+                        file_name: name,
+                        speak: `"${name}" is already on your timeline. Say another filename, or say play to preview.`
                     };
                 }
 
-                // Close OpenShot, edit the .osp, reopen
-                await killOpenShot();
-                await new Promise(r => setTimeout(r, 500));
+                const clip = await addClipToOspTimeline(_currentProjectPath, fileEntry.id, logFn);
 
-                const clip = addClipToOspTimeline(_currentProjectPath, fileEntry.id, logFn);
+                // Relaunch OpenShot in the background — don't await so we return immediately.
+                // The project loads while Nova is speaking the confirmation, so the user sees
+                // the updated timeline within a few seconds without Nova going silent.
                 launchOpenShot(_currentProjectPath);
-                await new Promise(r => setTimeout(r, 800));
+                _openShotKilled = false;
 
                 const name = fileEntry.name || fn;
                 return {
                     status: 'ok',
-                    speak: `Added "${name}" to the timeline at position ${clip.position.toFixed(1)} seconds. ` +
-                           `I've reopened the editor with it on the timeline. ` +
-                           `Would you like to add another clip, play the preview, or export the video?`
+                    file_name: name,
+                    remaining_files: getRemainingVideoFiles(_currentProjectPath),
+                    speak: `Done! "${name}" added to the timeline.`
                 };
             } catch (e) {
                 logFn(`🎬 add_to_timeline error: ${e.message}`);
+                launchOpenShot(_currentProjectPath); // restore editor on error
+                _openShotKilled = false;
                 return { status: 'error', speak: `I had trouble adding the clip: ${e.message.slice(0, 100)}` };
             }
         }
 
         case 'delete_clip': {
-            const isOpen = _videoEditorModeActive && await isOpenShotRunning();
-            if (!isOpen) return { status: 'error', speak: 'OpenShot is not open.' };
-            if (!canAutomate) {
-                return {
-                    status: 'needs_xdotool',
-                    speak: `I need xdotool to delete clips for you. Install it with: sudo pacman -S xdotool — then restart Nova.`
-                };
+            if (!_videoEditorModeActive) return { status: 'error', speak: 'OpenShot is not open.' };
+            if (!_currentProjectPath || !fs.existsSync(_currentProjectPath)) {
+                return { status: 'error', speak: 'I lost track of the project file. Please restart the video editor.' };
             }
-            logFn('🎬 Sending Delete key to OpenShot');
-            await sendKey('Delete');
+
+            const delName = (file_name || instruction || '').trim().toLowerCase().replace(/\.mp4$/i, '');
+            if (!delName) {
+                return { status: 'error', speak: 'Please tell me which video to remove from the timeline. For example, say "delete pokemon.mp4 from the timeline".' };
+            }
+
+            const proj = readOsp(_currentProjectPath);
+
+            // Find the file entry by name match
+            const delEntry = (proj.files || []).find(f =>
+                f.name?.toLowerCase().includes(delName) ||
+                path.basename(f.path || '').toLowerCase().includes(delName)
+            );
+
+            if (!delEntry) {
+                return { status: 'error', speak: `I couldn't find a file matching "${delName}" in this project.` };
+            }
+
+            // Remove all timeline clips for this file
+            const before = (proj.clips || []).length;
+            proj.clips = (proj.clips || []).filter(c => c.file_id !== delEntry.id);
+            const removed = before - proj.clips.length;
+
+            if (removed === 0) {
+                return { status: 'error', speak: `"${delEntry.name}" isn't on the timeline right now. It's in your project files but not placed on any track.` };
+            }
+
+            // Reload OpenShot with the updated project
+            await killOpenShot();
+            await new Promise(r => setTimeout(r, 500));
+            writeOsp(_currentProjectPath, proj);
+            launchOpenShot(_currentProjectPath);
+            await new Promise(r => setTimeout(r, 800));
+
+            logFn(`🎬 Deleted ${removed} clip(s) for "${delEntry.name}" from timeline`);
             return {
                 status: 'ok',
-                speak: `I\'ve pressed Delete. If a clip was selected in the timeline it\'s now removed. ` +
-                       `If nothing happened, click the clip first to select it, then ask me to delete again.`
+                speak: `Done! I've removed "${delEntry.name}" from the timeline. The editor has been updated. ` +
+                       `Want to add a different clip, or say "play" to preview what's left?`
             };
         }
 
         case 'play_preview': {
-            const isOpen = _videoEditorModeActive && await isOpenShotRunning();
-            if (!isOpen) return { status: 'error', speak: 'OpenShot is not open.' };
-            if (!canAutomate) {
-                return {
-                    status: 'needs_xdotool',
-                    speak: `I need xdotool to press play for you. Install it with: sudo pacman -S xdotool — then restart Nova.`
-                };
+            logFn(`🎬 play_preview: active=${_videoEditorModeActive} path=${_currentProjectPath}`);
+            if (!_videoEditorModeActive) return { status: 'error', speak: 'OpenShot is not open.' };
+            if (!_currentProjectPath || !fs.existsSync(_currentProjectPath)) {
+                return { status: 'error', speak: 'I lost track of the project file. Please restart the video editor.' };
             }
-            logFn('🎬 Toggling playback (Space)');
-            await sendKey('space');
+
+            const proj = readOsp(_currentProjectPath);
+            const allClips = proj.clips || [];
+            logFn(`🎬 play_preview: ${allClips.length} total clips in .osp, layers: [${[...new Set(allClips.map(c => c.layer))].join(',')}]`);
+
+            const TARGET_LAYER_P = 5000000;
+            let timelineClips = allClips
+                .filter(c => c.layer === TARGET_LAYER_P)
+                .sort((a, b) => (a.position || 0) - (b.position || 0));
+
+            // Fallback: if no clips on the target layer, try any layer (e.g. OpenShot moved them)
+            if (timelineClips.length === 0 && allClips.length > 0) {
+                logFn(`🎬 play_preview: no clips on layer 5000000 — falling back to all clips`);
+                timelineClips = [...allClips].sort((a, b) => (a.position || 0) - (b.position || 0));
+            }
+
+            if (timelineClips.length === 0) {
+                return { status: 'error', speak: 'No clips on the timeline yet! Add some videos first, then say play.' };
+            }
+
+            // has_audio can be boolean (our buildFileEntry) or keyframe object (if OpenShot re-saved the .osp)
+            function _hasAudioEnabled(val) {
+                if (typeof val === 'boolean') return val;
+                if (val && typeof val === 'object' && Array.isArray(val.Points)) {
+                    const y = val.Points[0]?.co?.Y;
+                    return y === undefined || Number(y) >= 0; // Y=-1 means disabled in OpenShot
+                }
+                return !!val;
+            }
+
+            // Build a map from file_id → { path, hasAudio }
+            // Resolve relative paths from the .osp's directory (OpenShot sometimes stores them relative)
+            const ospDir = path.dirname(_currentProjectPath);
+            const fileMap = {};
+            for (const f of (proj.files || [])) {
+                const rawPath = f.path || '';
+                const fPath = rawPath && !path.isAbsolute(rawPath)
+                    ? path.resolve(ospDir, rawPath)
+                    : rawPath;
+                fileMap[f.id] = { path: fPath, hasAudio: _hasAudioEnabled(f.has_audio) };
+            }
+            logFn(`🎬 play_preview: fileMap has ${Object.keys(fileMap).length} entries`);
+
+            const clipInfos = timelineClips.map(c => {
+                const fm = fileMap[c.file_id] || {};
+                const p = fm.path || '';
+                const exists = p ? fs.existsSync(p) : false;
+                logFn(`🎬   clip file_id=${c.file_id} path="${p}" exists=${exists} hasAudio=${fm.hasAudio} start=${c.start} end=${c.end}`);
+                return {
+                    path: p,
+                    hasAudio: fm.hasAudio !== false,
+                    start: c.start || 0,
+                    end:   c.end   || 30,
+                };
+            }).filter(c => c.path && fs.existsSync(c.path));
+
+            logFn(`🎬 play_preview: ${clipInfos.length} clips ready for ffmpeg`);
+            if (clipInfos.length === 0) {
+                const allPaths = timelineClips.map(c => fileMap[c.file_id]?.path || 'MISSING').join(', ');
+                logFn(`🎬 play_preview: missing files — ${allPaths}`);
+                return { status: 'error', speak: `Could not find the video files. Make sure the ${getVideosFolderName()} folder is accessible.` };
+            }
+
+            const projectName = path.basename(_currentProjectPath, '.osp');
+            const outputPath  = path.join(path.dirname(_currentProjectPath), `${projectName}_movie.mp4`);
+
+            logFn(`🎬 Rendering ${clipInfos.length} clip(s) → ${outputPath}`);
+
+            // Build ffmpeg filter_complex concat.
+            // - All clips are scaled to 1280x720 with letterbox padding (handles resolution mismatch).
+            // - Clips without an audio stream get a silent aevalsrc track so concat always works.
+            await new Promise((resolve, reject) => {
+                const inputs = clipInfos.map(c => {
+                    const safe = c.path.replace(/'/g, "'\\''");
+                    return `-i '${safe}'`;
+                }).join(' ');
+                const n = clipInfos.length;
+                const TARGET_W = 1280, TARGET_H = 720;
+                const vFilters = clipInfos.map((c, i) =>
+                    `[${i}:v]scale=${TARGET_W}:${TARGET_H}:force_original_aspect_ratio=decrease,` +
+                    `pad=${TARGET_W}:${TARGET_H}:(ow-iw)/2:(oh-ih)/2,` +
+                    `trim=start=${c.start}:end=${c.end},setpts=PTS-STARTPTS[v${i}]`);
+                const aFilters = clipInfos.map((c, i) => {
+                    if (c.hasAudio) {
+                        return `[${i}:a]atrim=start=${c.start}:end=${c.end},asetpts=PTS-STARTPTS[a${i}]`;
+                    }
+                    // No audio stream — synthesize silence matching clip duration
+                    const dur = (c.end - c.start).toFixed(3);
+                    return `aevalsrc=0:channel_layout=stereo:sample_rate=44100[_silent${i}];` +
+                           `[_silent${i}]atrim=0:${dur},asetpts=PTS-STARTPTS[a${i}]`;
+                });
+                const concatIn  = clipInfos.map((_, i) => `[v${i}][a${i}]`).join('');
+                const filterComplex = [
+                    ...vFilters, ...aFilters,
+                    `${concatIn}concat=n=${n}:v=1:a=1[outv][outa]`
+                ].join(';');
+                const outSafe = outputPath.replace(/'/g, "'\\''");
+                const cmd = `ffmpeg -y ${inputs} -filter_complex "${filterComplex}" -map "[outv]" -map "[outa]" -c:v libx264 -preset fast -c:a aac '${outSafe}'`;
+                logFn(`🎬 FFmpeg cmd: ${cmd.slice(0, 300)}...`);
+                exec(cmd, { timeout: 300000 }, (err, _stdout, stderr) => {
+                    if (err) {
+                        const detail = (stderr || '').split('\n')
+                            .filter(l => l.toLowerCase().includes('error') || l.includes('Invalid') || l.includes('failed'))
+                            .slice(-3).join(' ') || err.message;
+                        logFn(`🎬 FFmpeg error: ${detail}`);
+                        reject(new Error(`FFmpeg render failed: ${detail}`));
+                    } else {
+                        resolve();
+                    }
+                });
+            });
+
+            logFn(`🎬 Movie saved: ${outputPath}`);
+            openWithSystemPlayer(outputPath);
+
             return {
                 status: 'ok',
-                speak: `I\'ve pressed Space to play your video. Watch the preview window at the top right. Tell me to stop when done.`
+                speak: `Your movie is ready! I've saved it as "${projectName}_movie.mp4" in your ${getVideosFolderName()} folder and it's now playing. ` +
+                       `When you're done watching, say "close preview" to go back to editing. ` +
+                       `Say "save" to save the project, or "export" to use OpenShot's full export dialog.`
             };
         }
 
+        case 'close_preview':
         case 'stop_preview': {
-            const isOpen = _videoEditorModeActive && await isOpenShotRunning();
-            if (!isOpen) return { status: 'error', speak: 'OpenShot is not open.' };
-            if (!canAutomate) {
-                return { status: 'needs_xdotool', speak: 'I need xdotool to control playback. Install it: sudo pacman -S xdotool' };
-            }
-            await sendKey('space');
-            return { status: 'ok', speak: 'Stopped playback.' };
+            // Close any open video player — no xdotool needed
+            exec('pkill -f "_movie.mp4" 2>/dev/null; pkill mpv 2>/dev/null; pkill vlc 2>/dev/null; pkill celluloid 2>/dev/null; pkill totem 2>/dev/null; true');
+            return {
+                status: 'ok',
+                speak: `Preview closed. The editor is still open! ` +
+                       `You can add more clips, say "play" again to re-render and preview, say "save" to save, or say "close editor" when you're completely done.`
+            };
         }
 
         case 'save_project': {
-            const isOpen = _videoEditorModeActive && await isOpenShotRunning();
-            if (!isOpen) return { status: 'error', speak: 'OpenShot is not open.' };
+            if (!_videoEditorModeActive) return { status: 'error', speak: 'No editor session is active.' };
             if (!canAutomate) {
                 return { status: 'needs_xdotool', speak: 'I need xdotool to save for you. Install it: sudo pacman -S xdotool' };
             }
+            // If OpenShot was killed during editing, relaunch it so we can send Ctrl+S.
+            if (_openShotKilled || !(await isOpenShotRunning())) {
+                logFn('🎬 Relaunching OpenShot to save...');
+                launchOpenShot(_currentProjectPath);
+                _openShotKilled = false;
+                const wid = await waitForOpenShotWindow(20000);
+                if (!wid) return { status: 'error', speak: 'OpenShot took too long to open. Try saying save again.' };
+                await new Promise(r => setTimeout(r, 1000)); // extra settle time before keystroke
+            }
             logFn('🎬 Saving project (Ctrl+S)');
+            await focusOpenShot();
             await sendKey('ctrl+s');
+            await new Promise(r => setTimeout(r, 500));
             return {
                 status: 'ok',
-                speak: `I\'ve pressed Control S to save. If this is a new project OpenShot will ask you to pick a location — ` +
-                       `choose your Desktop or Videos folder and click Save.`
+                speak: `Project saved! Would you like to keep editing, or shall I close the editor?`
             };
         }
 
@@ -779,7 +1114,7 @@ async function handleVideoEditorTool(args, logFn) {
                 status: needsInstall ? 'needs_xdotool' : 'ok',
                 speak: needsInstall
                     ? `OpenShot is open but I can\'t control it yet — I need xdotool. Run: sudo pacman -S xdotool — then restart Nova for full control.`
-                    : `OpenShot is open and I have full control. What would you like to do? I can import a video, add it to the timeline, delete clips, preview, save, or export.`
+                    : `Editor is open! Say a filename to add it (e.g. "add video1.mp4"), "delete [filename]" to remove, "play" to preview, "save" to save, or "close editor" when done.`
             };
         }
 
@@ -788,18 +1123,21 @@ async function handleVideoEditorTool(args, logFn) {
             _editorOpening = false;
             _currentProjectPath = null;
             _veDebounce.clear();
-            logFn('🎬 Closing video editor session');
+            logFn('🎬 Closing video editor session (OpenShot + any preview player)');
+            // Kill OpenShot
             const p = process.platform;
             let closeCmd;
             if (p === 'linux')   closeCmd = `flatpak kill org.openshot.OpenShot 2>/dev/null; pkill -f openshot 2>/dev/null; true`;
             else if (p === 'darwin') closeCmd = `osascript -e 'tell application "OpenShot Video Editor" to quit' 2>/dev/null; true`;
             else if (p === 'win32')  closeCmd = `taskkill /IM openshot-qt.exe /F 2>nul & echo done`;
             if (closeCmd) exec(closeCmd);
+            // Also close any open video preview player
+            exec('pkill -f "_movie.mp4" 2>/dev/null; pkill mpv 2>/dev/null; pkill vlc 2>/dev/null; pkill celluloid 2>/dev/null; pkill totem 2>/dev/null; true');
             return {
                 status: 'ok',
-                speak: `Video editing session closed. OpenShot is shutting down. ` +
-                       `Your project was saved if you saved it during the session. ` +
-                       `Let me know whenever you want to start editing again!`
+                speak: `All done! The video editor and any preview windows are now closed. ` +
+                       `Your project is saved in your ${getVideosFolderName()} folder. ` +
+                       `Let me know whenever you'd like to start editing again!`
             };
         }
 

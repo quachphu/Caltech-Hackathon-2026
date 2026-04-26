@@ -23,6 +23,51 @@ function scanOspProjects() {
     catch { return []; }
 }
 
+const DOC_EXTS  = ['.pdf', '.doc', '.docx', '.xls', '.xlsx', '.ppt', '.pptx', '.txt', '.odt', '.ods', '.odp', '.csv', '.rtf'];
+const IMG_EXTS  = ['.jpg', '.jpeg', '.png', '.gif', '.webp', '.bmp', '.tiff', '.svg'];
+
+// Human-readable video folder name (matches video_editor.js helper)
+function getSystemVideosFolderName() {
+    return process.platform === 'darwin' ? 'Movies' : 'Videos';
+}
+
+function scanAttachableFiles(fileType) {
+    const home = os.homedir();
+    // Each type scans its primary folder first, then common download/desktop locations.
+    // All dirs are checked with fs.existsSync — missing ones are silently skipped,
+    // so this works identically on Linux, macOS, and Windows.
+    const configs = {
+        video:    { dirs: [path.join(home, 'Videos'), path.join(home, 'Movies'), path.join(home, 'Downloads'), path.join(home, 'Desktop')], exts: VIDEO_EXTS },
+        document: { dirs: [path.join(home, 'Documents'), path.join(home, 'Downloads'), path.join(home, 'Desktop')], exts: DOC_EXTS },
+        image:    { dirs: [path.join(home, 'Pictures'), path.join(home, 'Desktop'), path.join(home, 'Downloads')], exts: IMG_EXTS },
+    };
+    const { dirs, exts } = configs[fileType] || { dirs: [], exts: [] };
+    const results = [];
+    for (const dir of dirs) {
+        if (!fs.existsSync(dir)) continue;
+        // Scan root and one level of subdirectories (catches Screenshots/, etc.)
+        const scanDir = (d) => {
+            try {
+                for (const entry of fs.readdirSync(d, { withFileTypes: true })) {
+                    if (entry.isDirectory()) {
+                        try {
+                            for (const sub of fs.readdirSync(path.join(d, entry.name), { withFileTypes: true })) {
+                                if (sub.isFile() && exts.some(e => sub.name.toLowerCase().endsWith(e))) {
+                                    results.push({ name: sub.name, absPath: path.join(d, entry.name, sub.name) });
+                                }
+                            }
+                        } catch {}
+                    } else if (entry.isFile() && exts.some(e => entry.name.toLowerCase().endsWith(e))) {
+                        results.push({ name: entry.name, absPath: path.join(d, entry.name) });
+                    }
+                }
+            } catch {}
+        };
+        scanDir(dir);
+    }
+    return results.sort((a, b) => a.name.localeCompare(b.name));
+}
+
 let activeSession = null;
 let mainWindowRef = null;
 let automationRef = null;
@@ -48,6 +93,8 @@ let _emailLastCompletedAt = 0;       // Timestamp when last email flow finished 
 let _emailModeActive = false;        // True while user is in email mode (contacts panel open, post-send loop)
 let _listContactsLastAt = 0;         // Timestamp of last list_contacts call — prevents looping
 const LIST_CONTACTS_COOLDOWN_MS = 30000; // Block repeat list_contacts calls within 30s
+let _listAttachLastAt = 0;           // Timestamp of last list_attachable_files call
+const LIST_ATTACH_COOLDOWN_MS = 20000; // Block repeat calls within 20s
 const _codeAgentDebounce = new Map(); // action → last-call timestamp
 const _macroDebounce = new Map();    // action → last-call timestamp, 8s cooldown per macro action
 const MACRO_DEBOUNCE_MS = 8000;
@@ -77,14 +124,15 @@ const IMAGE_GEN_DEBOUNCE_MS        = 30000; // single image: ~5-10s, block 30s
 const IMAGE_GEN_BATCH_DEBOUNCE_MS  = 90000; // batch: parallel ~15s, block 90s
 const _videoEditorDebounce = new Map();
 const VIDEO_EDITOR_DEBOUNCE_MS = {
-    list_projects:   5000,   // filesystem read is instant; 5s blocks duplicate parallel calls
-    open_editor:     60000,  // opening + window detection can take 15-30s; block 60s to prevent duplicate launches
+    list_projects:   30000,  // user takes 5-15s to pick a project; 30s prevents re-call loop
+    open_editor:     300000, // session-length block (5 min) — editor echo cannot re-fire open_editor mid-session
     create_project:  15000,
-    import_file:     12000,  // import takes ~5s; 12s allows sequential imports without long waits
-    add_to_timeline: 10000,
-    delete_clip:     5000,
-    play_preview:    3000,
-    stop_preview:    3000,
+    import_file:     30000,  // 30s: prevents re-import within same "say next file" cycle
+    add_to_timeline: 15000,  // 15s: ACK TTS + echo tail + Gemini processing + buffer
+    delete_clip:     15000, // delete edits .osp and relaunches OpenShot — same cost as add_to_timeline
+    play_preview:    30000, // ffmpeg render takes 10-60s; block re-calls during render
+    stop_preview:    5000,
+    close_preview:   5000,
     save_project:    10000,
     export_video:    15000,
     undo:            3000,
@@ -243,7 +291,7 @@ async function startLiveSession(mainWindow, automation) {
                     "For ANY question or topic, respond verbally with your own knowledge. NEVER open a browser or run a command just to answer a question.\n" +
                     "This means: if someone asks about news, current events, weather, sports scores, stock prices, or ANYTHING informational — answer from your knowledge. " +
                     "Do NOT open the browser. Do NOT search Google. Just talk.\n" +
-                    "NEVER triggers for control_browser action='open': 'what is the news', 'noticias de hoy', 'current events', 'what happened today', 'latest news', 'tell me about X', 'what is X', 'how does X work', any question, any topic.\n\n" +
+                    "NEVER triggers for control_browser action='open': 'what is the news', 'current events', 'what happened today', 'latest news', 'tell me about X', 'what is X', 'how does X work', any question, any topic.\n\n" +
 
                     "== TOOL USAGE: STRICT TRIGGER RULES ==\n" +
                     "You have four tools. Use them ONLY when the user gives a direct, unambiguous action command. NEVER call a tool because the user mentioned a topic or asked a question.\n\n" +
@@ -351,22 +399,34 @@ async function startLiveSession(mainWindow, automation) {
                     "If any option is missing, ask for it first, then click.\n\n" +
 
                     "6. EMAIL MODE — a focused mode for sending emails. Stays active until the user says they are done.\n" +
-                    "   ENTERING EMAIL MODE:\n" +
+                    "   ╔══ MANDATORY SEQUENCE — follow EVERY step in ORDER, NEVER skip ══╗\n" +
                     "   STEP 1 — Call list_contacts FIRST to show the contacts panel.\n" +
-                    "   STEP 2 — Ask: 'Who would you like to email?' and wait for a name.\n" +
-                    "   STEP 3 — Ask: 'What would you like to say?' and let the user describe their intent.\n" +
-                    "   STEP 4 — Call send_email with recipient_name and message_intent.\n" +
-                    "   STEP 5 — Read back the subject and address confirmation: 'Should I send it?'\n" +
-                    "   STEP 6 — If user confirms → re-call send_email with confirmed=true.\n" +
+                    "   STEP 2 — Ask: 'Who would you like to email?' Wait for a name. Do NOT call send_email yet.\n" +
+                    "   STEP 3 — ATTACHMENT: Ask: 'Would you like to include an attachment with this email?' Wait.\n" +
+                    "     If YES → ask: 'Is it a video, document, or image?' then call list_attachable_files(file_type=...).\n" +
+                    "       The tool returns a numbered list. Read the list aloud, wait for the user's pick, confirm: 'Is [name] the right file?' Wait for yes/no.\n" +
+                    "       When confirmed → remember the exact attachment_path. Then go to STEP 4.\n" +
+                    "     If NO → go to STEP 4 without attachment_path.\n" +
+                    "   STEP 4 — SUBJECT: Ask: 'What would you like the subject of this email to be?' Wait for their answer. Remember it as subject.\n" +
+                    "   STEP 5 — CONTENT: Ask: 'What would you like to say in this email?' Wait for their answer. Remember it as message_intent.\n" +
+                    "   STEP 6 — NOW call send_email(recipient_name, subject, message_intent, attachment_path if any).\n" +
+                    "             The backend generates the full professional email body from message_intent.\n" +
+                    "   STEP 7 — Read back the [EMAIL PREVIEW] the backend returns: say the subject, summarize the body, mention attachment if any.\n" +
+                    "             Ask: 'Does this look good? Say yes to send, or tell me what to change.'\n" +
+                    "             - User says YES → re-call send_email with confirmed=true + all args from the preview.\n" +
+                    "             - Subject change → ask what they prefer, re-call send_email with new subject (no confirmed_body, no confirmed=true).\n" +
+                    "             - Content change → ask what to change, re-call send_email with updated message_intent (no confirmed_body, no confirmed=true).\n" +
+                    "             - User says NO/cancel → say 'Got it, email cancelled.' Do NOT call send_email.\n" +
                     "   AFTER SENDING (stay in email mode):\n" +
-                    "   STEP 7 — Say 'Email sent!' then ask: 'Would you like to send another email, or are you all done?'\n" +
-                    "   STEP 8a — If user wants ANOTHER email: call control_contacts_panel with action='close_browser_keep_contacts'. Then ask 'Who would you like to email next?' and go back to STEP 3.\n" +
-                    "   STEP 8b — If user is DONE: call control_contacts_panel with action='close_email_mode'. Say 'All done! Back to normal.' Do NOT call any other tool.\n" +
-                    "   SCROLLING CONTACTS: If user says 'scroll up', 'scroll down', 'show more', 'go up/down' → call control_contacts_panel with action='scroll_up' or 'scroll_down'.\n" +
-                    "   - AUTH: If the tool returns auth_required → tell the user to run npm run setup-google.\n" +
-                    "   - CANCEL: If user says cancel/stop at any time → call control_contacts_panel with action='close_email_mode'.\n" +
-                    "   - DISAMBIGUATION: If tool returns a numbered list, speak it and wait. Re-call with selected_index.\n" +
-                    "   - WORD-BY-WORD: If tool asks for username or domain, speak the question and re-call with recipient_email.\n\n" +
+                    "   STEP 8 — Say 'Email sent!' then ask: 'Would you like to send another email, or are you all done?'\n" +
+                    "   STEP 9a — If ANOTHER: call control_contacts_panel action='close_browser_keep_contacts'. Then go to STEP 2.\n" +
+                    "   STEP 9b — If DONE: call control_contacts_panel action='close_email_mode'. Say 'All done!' Do NOT call any tool.\n" +
+                    "   ╚══ CRITICAL: NEVER call send_email until you have completed STEPs 2, 3, 4, and 5. ══╝\n" +
+                    "   SCROLLING CONTACTS: 'scroll up/down' → control_contacts_panel scroll_up/scroll_down.\n" +
+                    "   - AUTH: If auth_required → tell user to run npm run setup-google.\n" +
+                    "   - CANCEL: User says cancel/stop → control_contacts_panel action='close_email_mode'.\n" +
+                    "   - DISAMBIGUATION: If multiple contacts found, speak numbered list and re-call with selected_index.\n" +
+                    "   - WORD-BY-WORD: If no contact found, ask for email username/domain and re-call with recipient_email.\n\n" +
 
                     "7. calendar_action — ONLY for explicit calendar operations: checking schedule, creating events, cancelling events, checking availability.\n" +
                     "   - get_events triggers: 'what's on my calendar', 'what do I have this week', 'what's my schedule', 'what's my next meeting'\n" +
@@ -479,51 +539,67 @@ async function startLiveSession(mainWindow, automation) {
                     (() => {
                         const projs = scanOspProjects();
                         const vids  = scanVideoFiles();
-                        const projList = projs.length ? projs.map((p,i) => `${i+1}. ${p}`).join(', ') : 'none';
-                        const vidList  = vids.length  ? vids.map((v,i)  => `${i+1}. ${v}`).join(', ') : 'none';
+                        const projList = projs.length ? projs.join(', ') : 'none';
+                        const vidList  = vids.filter(v => !v.toLowerCase().includes('_movie')).join(', ') || 'none';
                         return (
                     "11. video_editor_action — Open and control OpenShot Video Editor. Stay in video editing mode until user says 'close', 'done editing', or 'I'm done'.\n" +
-                    "   ACTIVATION TRIGGERS: 'help me edit a video', 'open openshot', 'I want to edit a video', 'let's edit a video', 'open the video editor'\n\n" +
-                    `   KNOWN PROJECTS IN ~/Videos/: ${projList}\n` +
-                    `   KNOWN VIDEO FILES IN ~/Videos/: ${vidList}\n\n` +
+                    "   ACTIVATION TRIGGERS (any language): User wants to EDIT or compile existing video files into a project — e.g. 'help me edit a video', 'open the video editor', or any equivalent phrase in any language. This is for EDITING existing files, NOT for AI video generation.\n" +
+                    "   KEY DISTINCTION: 'edit a video' = this tool (OpenShot). 'create/generate/make a video' = tool #12 (AI generation). If unsure, ASK the user: 'Do you want to edit existing video files, or generate a new AI video?'\n\n" +
+                    `   EDITOR PROJECTS (.osp saved projects — for open_editor existing): ${projs.length ? projs.map((p,i)=>`${i+1}. ${p}`).join(', ') : 'NONE — user has no saved projects yet'}\n` +
+                    `   RAW VIDEO FILES (.mp4 etc — for add_to_timeline ONLY, NOT projects): ${vidList}\n\n` +
                     "   ╔══ MANDATORY WORKFLOW ══╗\n" +
-                    "   STEP 1 — PROJECT SELECTION (ask once, then execute):\n" +
-                    "     Ask: 'New project or open an existing one?'\n" +
-                    "     If EXISTING → read the KNOWN PROJECTS list above out loud. User picks by number.\n" +
-                    "       → call open_editor(project_mode='existing', file_name='<exact name from list>')\n" +
-                    "       Do NOT call list_projects — you already have the list above.\n" +
-                    "     If NEW → ask project name → call open_editor(project_mode='new', file_name='<name>')\n" +
-                    "   STEP 2 — IMPORT LOOP:\n" +
-                    "     After editor opens: read the KNOWN VIDEO FILES list above as numbered options.\n" +
-                    "     User says number → call import_file(file_name='<resolved name>') immediately.\n" +
-                    "     After each import → ask: 'Would you like to import another video?'\n" +
-                    "     If YES → read the list again → import. Repeat until done.\n" +
-                    "     If NO → ask: 'How would you like to arrange these on the timeline?'\n" +
-                    "   STEP 3 — TIMELINE ORDERING:\n" +
-                    "     User describes order (e.g. 'pokemon first, then video1')\n" +
-                    "     → call add_to_timeline for each IN ORDER, one at a time.\n" +
-                    "     Confirm each: 'Added pokemon. Adding video1 now...'\n" +
-                    "   STEP 4 — EDITING: play_preview → save_project → export_video.\n" +
+                    "   STEP 1 — PROJECT SELECTION:\n" +
+                    "     When activated, ask: 'New project or open an existing one?' — DO NOT call any tool yet. Wait for user answer.\n" +
+                    "     DO NOT call list_projects, guide, or open_editor until user has answered.\n" +
+                    "     If EXISTING:\n" +
+                    (projs.length > 0
+                        ? `       Speak ONLY these saved projects as numbered options: ${projs.map((p,i)=>`${i+1}. ${p}`).join(', ')}.\n` +
+                          "       NEVER mention video files (.mp4) as project options — they are NOT projects.\n" +
+                          "       The instant user picks a number or name → call open_editor(project_mode='existing', file_name='<exact name>') immediately. DO NOT call list_projects.\n"
+                        : "       Say: 'You have no saved projects yet. What would you like to name your new project?'\n" +
+                          "       Wait for the user's name, then call open_editor(project_mode='new', file_name='<name they said>').\n"
+                    ) +
+                    "     If NEW:\n" +
+                    "       Ask: 'What should I name the project? Just say the name.' WAIT for their answer.\n" +
+                    "       The user may answer in ANY language — that's fine. Extract ONLY the project name (a word or short phrase), NOT conversational filler like 'I think', 'maybe', 'um', 'let me see', or similar phrases in any language.\n" +
+                    "       If what the user said sounds like conversation filler rather than a name, ask again: 'Just the project name — what do you want to call it?'\n" +
+                    "       Repeat the name back: 'Got it — I'll call it [name].' Then call open_editor(project_mode='new', file_name='<name>') IMMEDIATELY. NEVER invent a name.\n" +
+                    "     CRITICAL: open_editor is ONE-SHOT per session — NEVER call it a second time.\n" +
+                    "   STEP 2 — ADD TO TIMELINE (main action, ANY LANGUAGE):\n" +
+                    "     User says a filename or asks to add/import a video → call import_file(file_name='X') IMMEDIATELY.\n" +
+                    "     Match what they said to the available video files list above. Even partial match is fine — 'League1' → 'League1.mp4'.\n" +
+                    "     NEVER call open_editor when the user says a filename or asks to add/import — call import_file instead.\n" +
+                    "     If you are NOT CERTAIN what filename was said → ask: 'Which file? Say the complete filename.' — do NOT guess.\n" +
+                    "   STEP 3 — DELETE: User asks to delete/remove a video from the timeline → action='delete_clip', file_name='[filename]'\n" +
+                    "   STEP 4 — PREVIEW: User asks to play/preview/watch the video → action='play_preview' (renders and opens in video player)\n" +
                     "   ╚══════════════════════════════════════════════════╝\n\n" +
+                    "   NOTE: Users may speak in ANY language. Use your multilingual understanding to map their words to the correct action.\n" +
+                    "   ALWAYS respond in the SAME language the user is using — never switch languages.\n\n" +
                     "   ACTION MAP:\n" +
-                    "   - 'open existing' → read the KNOWN PROJECTS list, then call open_editor\n" +
-                    "   - 'import X' / 'number N' → action='import_file', file_name='<name from KNOWN VIDEO FILES list>'\n" +
-                    "   - 'add to timeline' → action='add_to_timeline', file_name='X'\n" +
-                    "   - 'play' → action='play_preview' | 'stop' → action='stop_preview'\n" +
+                    "   - User asks to open an existing project → speak the EDITOR PROJECTS list (only .osp files, never .mp4), get their choice, call open_editor immediately\n" +
+                    "   - User asks to list their projects → ONLY then call list_projects\n" +
+                    "   - User says a filename / asks to add a file → call add_to_timeline(file_name='[filename]') immediately\n" +
+                    "   - User asks to import a file → call import_file(file_name='[filename]') — also adds to timeline\n" +
+                    "   - User asks to delete/remove a file from timeline → action='delete_clip', file_name='[filename]'\n" +
+                    "   - User asks to play/preview/watch → action='play_preview'\n" +
+                    "   - User asks to close/stop the preview → action='close_preview'\n" +
                     "   - 'save' → action='save_project' | 'export' → action='export_video'\n" +
-                    "   - 'undo' → action='undo' | 'redo' → action='redo' | 'close' → action='close_editor'\n\n" +
-                    "   RULES:\n" +
-                    "   - NEVER call list_projects — the project list is already in this prompt.\n" +
-                    "   - NEVER call open_editor more than once per session.\n" +
-                    "   - NEVER ask what folder to look in — always use the Videos folder.\n" +
-                    "   - Speak naturally — you are their hands-free video editing co-pilot.\n\n"
+                    "   - 'undo' → action='undo' | 'redo' → action='redo'\n" +
+                    "   - 'close editor' → action='close_editor' (closes EVERYTHING — only when user explicitly says this)\n" +
+                    "   - 'what can you do' / 'help' → action='guide'\n\n" +
+                    "   CRITICAL RULES:\n" +
+                    "   - add_to_timeline and import_file BOTH require a clearly spoken file_name. If unclear → ask 'Which file?' — do NOT guess.\n" +
+                    "   - BOTH are ONE-STEP: call once with the filename and it executes immediately. No confirmation.\n" +
+                    "   - delete_clip REQUIRES a file_name. If no filename spoken → ASK which file to remove.\n" +
+                    "   - NEVER call open_editor more than ONCE per session. If the editor is already open, do NOT call open_editor again.\n" +
+                    "   - 'close preview' ≠ 'close editor'. Close preview only closes the video player.\n" +
+                    "   - Keep guiding the user — never go silent. After each action, tell them what to do next.\n\n"
                         );
                     })() +
 
-                    "12. generate_video — Generate a cinematic 8-second AI video with audio/speech using Veo and save it to the Videos folder.\n" +
-                    "   TRIGGER PHRASES: 'generate a video', 'create a video', 'make a video', 'make me a video about',\n" +
-                    "   'produce a video', 'make an AI video', 'generate a clip', 'create a short film about',\n" +
-                    "   'can you generate a video', 'I want a video of'\n\n" +
+                    "12. generate_video — Generate a cinematic 8-second AI video with audio/speech using Veo and save it to the Videos/Movies folder.\n" +
+                    "   TRIGGER PHRASES (any language): User wants to CREATE or GENERATE a brand-new AI video from scratch — e.g. 'generate a video', 'create a video', 'make a video about X', or any equivalent in any language. This is NOT for editing existing files.\n" +
+                    "   KEY DISTINCTION: 'generate/create/make a new video' = this tool (AI generation). 'edit/compile existing videos' = tool #11 (OpenShot editor).\n\n" +
                     "   ╔══ MANDATORY 8-QUESTION FLOW — ask ONE at a time, wait for answer, then ask next ══╗\n" +
                     "   You MUST collect ALL 8 answers before calling the tool. Never skip a question.\n\n" +
                     "   Q1 — 'What is the main topic or story of the video?'\n" +
@@ -541,7 +617,7 @@ async function startLiveSession(mainWindow, automation) {
                     "   - 'show my video prompts' / 'what video prompts do I have' → call generate_video(action='list_prompts')\n" +
                     "   - User wants to regenerate with improvements → ask WHAT to change, then call generate_video(action='generate') with the improved args.\n" +
                     "   - 'delete that prompt' / 'remove that one' / 'I don't like it, delete it' → call generate_video(action='delete_prompt', prompt_id_to_delete='<id from list>')\n\n" +
-                    "   AFTER VIDEO IS DONE: Tell user the file is in their Videos folder and is opening now. Ask how it looks and if anything needs improving.\n" +
+                    "   AFTER VIDEO IS DONE: Tell user the file is in their Videos or Movies folder and is opening now. Ask how it looks and if anything needs improving.\n" +
                     "   If they want changes: ask exactly WHAT to change (dialogue? camera? style? setting?), collect updated answers, then regenerate.\n" +
                     "   NEVER call generate_video again while a generation is in flight — it takes 2-5 minutes.\n\n" +
 
@@ -663,6 +739,14 @@ async function startLiveSession(mainWindow, automation) {
                                         selected_index: {
                                             type: "NUMBER",
                                             description: "When Nova presented a numbered list of matching contacts (1, 2, 3, or 4), set this to the number the user chose."
+                                        },
+                                        attachment_path: {
+                                            type: "STRING",
+                                            description: "Absolute path to the file to attach. Only set this after the user confirmed the attachment file via list_attachable_files and verbal confirmation. Never guess a path."
+                                        },
+                                        confirmed_body: {
+                                            type: "STRING",
+                                            description: "The pre-generated email body that the user already confirmed. Pass this through on the confirmed=true re-call so it doesn't regenerate."
                                         }
                                     },
                                     required: ["recipient_name", "message_intent"]
@@ -680,6 +764,21 @@ async function startLiveSession(mainWindow, automation) {
                                         }
                                     },
                                     required: []
+                                }
+                            },
+                            {
+                                name: "list_attachable_files",
+                                description: "List files the user can attach to an email. Call this when the user says they want to attach a video, document, or image. Returns a list of files from the appropriate system folder with their absolute paths.",
+                                parameters: {
+                                    type: "OBJECT",
+                                    properties: {
+                                        file_type: {
+                                            type: "STRING",
+                                            enum: ["video", "document", "image"],
+                                            description: "Type of file to list: 'video' scans Videos/Movies/Downloads, 'document' scans Documents/Downloads/Desktop, 'image' scans Pictures/Desktop/Downloads."
+                                        }
+                                    },
+                                    required: ["file_type"]
                                 }
                             },
                             {
@@ -880,14 +979,14 @@ async function startLiveSession(mainWindow, automation) {
                                         action: {
                                             type: "STRING",
                                             enum: ["list_projects", "open_editor", "import_file", "add_to_timeline", "delete_clip",
-                                                   "play_preview", "stop_preview", "save_project", "export_video",
+                                                   "play_preview", "stop_preview", "close_preview", "save_project", "export_video",
                                                    "undo", "redo", "guide", "close_editor"],
                                             description: "Video editor action to perform."
                                         },
                                         project_mode: {
                                             type: "STRING",
                                             enum: ["new", "existing"],
-                                            description: "For open_editor only: 'new' to create a fresh project, 'existing' to open one from the Videos folder."
+                                            description: "For open_editor only: 'new' to create a fresh project, 'existing' to open one from the Videos/Movies folder."
                                         },
                                         file_name: {
                                             type: "STRING",
@@ -896,6 +995,10 @@ async function startLiveSession(mainWindow, automation) {
                                         instruction: {
                                             type: "STRING",
                                             description: "Additional instruction or context for the guide action."
+                                        },
+                                        confirmed: {
+                                            type: "BOOLEAN",
+                                            description: "Unused — kept for backwards compatibility. Do NOT set this. add_to_timeline now executes immediately on first call."
                                         }
                                     },
                                     required: ["action"]
@@ -1191,8 +1294,11 @@ async function startLiveSession(mainWindow, automation) {
                                 // Debounce — smart_click uses its OWN clock so it is never
                                 // blocked by a recent 'open' (Gemini often batches open+click).
                                 // All other actions share the general debounce.
+                                // close gets a longer debounce (10s) because echoed TTS can re-trigger it.
                                 const nowBrowser = Date.now();
                                 const isClick = action === 'smart_click' || action === 'click_id';
+                                const isClose = action === 'close';
+                                const debounceCutoff = isClose ? 10000 : 3000;
                                 if (isClick) {
                                     if (nowBrowser - _lastSmartClickAt < 1500) {
                                         console.log(`🛡️ smart_click debounced — duplicate click too soon.`);
@@ -1205,14 +1311,21 @@ async function startLiveSession(mainWindow, automation) {
                                         return;
                                     }
                                 } else {
-                                    if (nowBrowser - _lastBrowserActionAt < 3000) {
+                                    if (nowBrowser - _lastBrowserActionAt < debounceCutoff) {
                                         console.log(`🛡️ Browser action debounced — too soon after last action.`);
                                         activeSession.sendRealtimeInput({
                                             functionResponses: [{
                                                 id: call.id,
-                                                response: { status: "Skipped", message: "Already performed recently. Resume conversation." }
+                                                response: { status: "Skipped", message: "Already performed recently. Resume conversation normally." }
                                             }]
                                         });
+                                        // For close debounces: inject a text nudge so Gemini doesn't go silent
+                                        if (isClose) {
+                                            setTimeout(() => {
+                                                if (!activeSession) return;
+                                                try { activeSession.sendRealtimeInput({ text: '[BROWSER ALREADY CLOSED] The browser is closed. You are in normal conversation mode now. Speak naturally to the user and wait for their next request.' }); } catch (_) {}
+                                            }, 300);
+                                        }
                                         return;
                                     }
                                 }
@@ -1223,9 +1336,14 @@ async function startLiveSession(mainWindow, automation) {
                                     activeSession.sendRealtimeInput({
                                         functionResponses: [{
                                             id: call.id,
-                                            response: { status: "Skipped", message: "Browser is not open. Resume conversation normally without mentioning the browser." }
+                                            response: { status: "Skipped", message: "Browser is not open. You are in normal conversation mode." }
                                         }]
                                     });
+                                    // Inject a text nudge to break Gemini out of the close loop
+                                    setTimeout(() => {
+                                        if (!activeSession) return;
+                                        try { activeSession.sendRealtimeInput({ text: '[BROWSER ALREADY CLOSED] The browser is not open. Return to normal conversation — speak to the user naturally and wait for their next request. Do NOT call control_browser again.' }); } catch (_) {}
+                                    }, 300);
                                     return;
                                 }
 
@@ -1327,6 +1445,9 @@ async function startLiveSession(mainWindow, automation) {
                                             _browserIsOpen = false;
                                             _lastExplicitCloseAt = nowBrowser;
                                             _storeAssistantActive = false;
+                                            // Stamp _lastBrowserActionAt so the 10s debounce blocks
+                                            // any echo-driven re-fires of 'close' from TTS playback.
+                                            _lastBrowserActionAt = nowBrowser;
                                         }
                                     }
                                 }
@@ -1359,7 +1480,11 @@ async function startLiveSession(mainWindow, automation) {
                                     setTimeout(() => {
                                         if (!activeSession) return;
                                         try {
-                                            activeSession.sendRealtimeInput({ text: 'Say out loud right now: "Done, browser closed." — Do NOT call any tool.' });
+                                            activeSession.sendRealtimeInput({
+                                                text: '[BROWSER CLOSED] Say out loud: "Done, browser closed!" then wait for the user to speak. ' +
+                                                      'You are now in normal conversation mode. Do NOT call control_browser or any other tool unless the user asks. ' +
+                                                      'Do NOT say "close" or "browser" again — just wait for the user.'
+                                            });
                                         } catch (_) {}
                                     }, 400);
                                 }
@@ -1474,6 +1599,60 @@ async function startLiveSession(mainWindow, automation) {
                                     });
                                 }
 
+                            } else if (call.name === 'list_attachable_files') {
+                                const fileType = (call.args && call.args.file_type) || 'document';
+                                const _nowAttach = Date.now();
+
+                                // Debounce: prevent duplicate scans within 20s
+                                if (_nowAttach - _listAttachLastAt < LIST_ATTACH_COOLDOWN_MS) {
+                                    console.log(`📎 [Attachment] Debounced duplicate list_attachable_files`);
+                                    try {
+                                        activeSession.sendRealtimeInput({
+                                            functionResponses: [{ id: call.id, response: { status: 'already_shown', message: 'File list already shown. Wait for user to pick a file.' } }]
+                                        });
+                                    } catch (_) {}
+                                    return;
+                                }
+                                _listAttachLastAt = _nowAttach;
+
+                                console.log(`📎 [Attachment] Scanning for ${fileType} files...`);
+                                const files = scanAttachableFiles(fileType);
+
+                                // Show the panel on the UI immediately
+                                if (automationRef && automationRef.showAttachmentsPanel) {
+                                    automationRef.showAttachmentsPanel(files, fileType);
+                                }
+
+                                // ACK the function call
+                                try {
+                                    activeSession.sendRealtimeInput({
+                                        functionResponses: [{ id: call.id, response: { status: 'ok', count: files.length } }]
+                                    });
+                                } catch (_) {}
+
+                                let instr;
+                                if (files.length === 0) {
+                                    const folderName = fileType === 'video' ? getSystemVideosFolderName() : fileType === 'document' ? 'Documents' : 'Pictures';
+                                    instr =
+                                        `[NO ${fileType.toUpperCase()} FILES] Say: "I couldn't find any ${fileType} files in your ${folderName} folder." ` +
+                                        `Then ask: "Would you like to skip the attachment, or try a different file type — video, document, or image?"`;
+                                } else {
+                                    // Build an explicit lookup table for Gemini (name → exact path)
+                                    const cap = files.slice(0, 20);
+                                    const lookupLines = cap.map((f, i) => `  ${i + 1}. "${f.name}" → "${f.absPath}"`).join('\n');
+                                    const spokenNames = cap.map((f, i) => `${i + 1}. ${f.name}`).join(', ');
+                                    instr =
+                                        `[${fileType.toUpperCase()} FILES FOUND — ${cap.length} files shown in panel]\n` +
+                                        `FILE LOOKUP TABLE (use the exact quoted path for attachment_path):\n${lookupLines}\n\n` +
+                                        `Say out loud: "I found ${cap.length} ${fileType} file${cap.length !== 1 ? 's' : ''}: ${spokenNames}. Which one would you like to attach?"\n` +
+                                        `Wait for the user. When they say a name, match it to the nearest entry in the lookup table above.\n` +
+                                        `Then say: "Is [matched name] the one you want to attach?" and wait for yes or no.\n` +
+                                        `If YES: remember the exact attachment_path from the lookup table. Then go to STEP 4 — ask: "What would you like the subject of this email to be?"\n` +
+                                        `If NO: ask again which file.\n` +
+                                        `CRITICAL: Do NOT call send_email yet. You still need to ask for subject (STEP 4) and message content (STEP 5) first.`;
+                                }
+                                try { activeSession.sendRealtimeInput({ text: instr }); } catch (_) {}
+
                             } else if (call.name === 'list_contacts') {
                                 const _nowContacts = Date.now();
                                 const _msSinceContacts = _nowContacts - _listContactsLastAt;
@@ -1566,9 +1745,11 @@ async function startLiveSession(mainWindow, automation) {
                                 } else if (action === 'close_email_mode') {
                                     _emailModeActive = false;
                                     _emailInFlight = false;
+                                    _listAttachLastAt = 0; // reset attachment debounce for next session
                                     _emailLastCompletedAt = Date.now(); // keep cooldown active to block stale calls from the closing session
                                     if (automationRef && automationRef.closeBrowser) automationRef.closeBrowser();
                                     if (automationRef && automationRef.hideContactsPanel) automationRef.hideContactsPanel();
+                                    if (automationRef && automationRef.hideAttachmentsPanel) automationRef.hideAttachmentsPanel();
                                     if (mainWindowRef && !mainWindowRef.isDestroyed()) {
                                         mainWindowRef.webContents.send('show-status-message', '');
                                     }
@@ -1585,16 +1766,19 @@ async function startLiveSession(mainWindow, automation) {
                                 console.log(`📧 [Email Tool] recipient="${_emailArgs.recipient_name}" confirmed=${!!_emailArgs.confirmed} intent="${_emailArgs.message_intent}"`);
 
                                 // Block duplicate/looping calls: only one email flow at a time.
-                                // IMPORTANT: confirmed=true calls (user said "yes") are ALWAYS allowed
-                                // through — they are the intentional confirmation step, never duplicates.
-                                // Only unconfirmed calls are subject to the mutex and cooldown.
+                                // confirmed=true (user said "yes, send it") is NEVER blocked by a time-based
+                                // cooldown — it is the intentional confirmation step and must always go through.
+                                // Only unconfirmed calls (preview generation) are subject to the cooldown.
                                 const _isConfirmation = !!_emailArgs.confirmed;
                                 const _emailCooldownMs = 8000;
-                                const _confirmCooldownMs = 6000; // short window after a send to block stale confirmed=true duplicates
                                 const _timeSinceLast = Date.now() - _emailLastCompletedAt;
-                                const _effectiveCooldown = _isConfirmation ? _confirmCooldownMs : _emailCooldownMs;
-                                if (_emailInFlight || _timeSinceLast < _effectiveCooldown) {
-                                    console.log(`📧 [Email] Blocked duplicate call (inFlight=${_emailInFlight}, msSinceLast=${_timeSinceLast}, cooldown=${_effectiveCooldown})`);
+                                // confirmed=true: block ONLY if another call is literally in-flight right now
+                                // confirmed=false: block if in-flight OR within cooldown (prevents rapid loops)
+                                const _shouldBlock = _isConfirmation
+                                    ? _emailInFlight
+                                    : (_emailInFlight || _timeSinceLast < _emailCooldownMs);
+                                if (_shouldBlock) {
+                                    console.log(`📧 [Email] Blocked duplicate call (inFlight=${_emailInFlight}, confirmed=${_isConfirmation}, msSinceLast=${_timeSinceLast}, cooldown=${_isConfirmation ? 'n/a' : _emailCooldownMs})`);
                                     try {
                                         activeSession.sendRealtimeInput({
                                             functionResponses: [{
@@ -1608,6 +1792,22 @@ async function startLiveSession(mainWindow, automation) {
                                     } catch (_) {}
                                     return;
                                 }
+                                // Hard gate: reject send_email calls that skipped the collection steps.
+                                // Gemini must collect message_intent (STEP 5) before calling this.
+                                // confirmed=true calls always pass (user already confirmed the full draft).
+                                if (!_isConfirmation && !(_emailArgs.message_intent || '').trim()) {
+                                    _emailInFlight = false;
+                                    try {
+                                        activeSession.sendRealtimeInput({
+                                            functionResponses: [{ id: call.id, response: {
+                                                status: 'missing_content',
+                                                message: `You skipped required steps. Say: "Let me back up." Then ask STEP 3: "Would you like to include an attachment?" — wait for answer. Then STEP 4: "What would you like the subject to be?" — wait. Then STEP 5: "What would you like to say?" — wait. Only THEN call send_email.`
+                                            }}]
+                                        });
+                                    } catch (_) {}
+                                    return;
+                                }
+
                                 _emailInFlight = true;
 
                                 // Acknowledge immediately so Nova says something while the async
@@ -1618,7 +1818,7 @@ async function startLiveSession(mainWindow, automation) {
                                         id: call.id,
                                         response: {
                                             status: "Processing",
-                                            message: `Looking up the contact for this email request. Say out loud: "Let me look that up." Then stay quiet while processing.`
+                                            message: `Looking up the contact and preparing the email. Say out loud: "Let me get that ready!" Then stay quiet while processing.`
                                         }
                                     }]
                                 });
@@ -1650,19 +1850,26 @@ async function startLiveSession(mainWindow, automation) {
                                             case 'draft_saved':
                                                 instr = `[EMAIL DRAFT SAVED] ${speakText} Speak this out loud now. Do NOT call any tool.`;
                                                 break;
-                                            case 'needs_confirmation':
-                                                instr =
-                                                    `[EMAIL CONFIRM NEEDED] Speak this EXACT sentence to the user: "${speakText}" — then wait for their answer. ` +
-                                                    `If they say yes/sure/ok/send it/confirm: call send_email again with these EXACT args: ` +
+                                            case 'needs_confirmation': {
+                                                const confirmArgs =
                                                     `confirmed=true, ` +
                                                     `recipient_name="${_emailArgs.recipient_name || ''}", ` +
                                                     `recipient_email="${result.recipient_email || ''}", ` +
                                                     `subject="${result.confirmed_subject || _emailArgs.subject || ''}", ` +
                                                     `message_intent="${_emailArgs.message_intent || ''}", ` +
-                                                    `draft_only=${!!_emailArgs.draft_only}. ` +
-                                                    `If they say no/cancel/stop: say "Got it, email cancelled." and do NOT call send_email again.` +
+                                                    `confirmed_body="${(result.confirmed_body || '').replace(/"/g, "'")}", ` +
+                                                    `draft_only=${!!_emailArgs.draft_only}` +
+                                                    (result.attachment_path ? `, attachment_path="${result.attachment_path}"` : '');
+                                                instr =
+                                                    `[EMAIL PREVIEW — read this to the user now] ${speakText} ` +
+                                                    `After reading it, ask: "Does this look good? Say yes to send, or tell me what to change." ` +
+                                                    `If they say yes/send/looks good/correct: call send_email with these EXACT args: ${confirmArgs}. ` +
+                                                    `If they want to change the subject: ask what they prefer, then re-call send_email with the new subject (no confirmed_body, no confirmed=true). ` +
+                                                    `If they want to change the content: ask what to change, then re-call send_email with updated message_intent (no confirmed_body, no confirmed=true). ` +
+                                                    `If they say no/cancel: say "Got it, email cancelled." and do NOT call send_email again.` +
                                                     (extraNames ? ` [Known contacts: ${extraNames}]` : '');
                                                 break;
+                                            }
                                             case 'needs_disambiguation':
                                                 instr =
                                                     `[EMAIL MULTIPLE CONTACTS] Speak this out loud: "${speakText}" — then wait for the user's choice. ` +
@@ -2243,22 +2450,64 @@ async function startLiveSession(mainWindow, automation) {
                                 }
                             } else if (call.name === 'video_editor_action') {
                                 const { action } = call.args;
-                                const veKey = action;
                                 const nowVE = Date.now();
 
-                                if (nowVE - (_videoEditorDebounce.get(veKey) || 0) < (VIDEO_EDITOR_DEBOUNCE_MS[veKey] || 5000)) {
+                                // Per-filename debounce for import_file and add_to_timeline:
+                                // only block the SAME file from being added twice (echo prevention).
+                                // Different filenames get independent debounce keys so they aren't blocked.
+                                const _veFileName = (call.args.file_name || '').toLowerCase().replace(/\.[^.]+$/, '').trim();
+                                const veKey = (action === 'import_file' || action === 'add_to_timeline') && _veFileName
+                                    ? `${action}:${_veFileName}`
+                                    : action;
+                                const veWindow = VIDEO_EDITOR_DEBOUNCE_MS[action] || 5000;
+
+                                if (nowVE - (_videoEditorDebounce.get(veKey) || 0) < veWindow) {
                                     console.log(`🎬 [VideoEditor] Debounced duplicate: ${veKey}`);
                                     try {
+                                        // IMPORTANT: debounce responses for open_editor must NOT contain speak
+                                        // instructions. Multiple competing "Say:" responses cause Gemini to go
+                                        // silent. The real guidance comes from the single delayed fn-response.
+                                        const debounceMsg = veKey === 'list_projects'
+                                            ? `The project list was already shown. The user has made their choice. Call open_editor(project_mode='existing', file_name='<name they said>') RIGHT NOW. Do NOT call list_projects again.`
+                                            : veKey === 'open_editor'
+                                            ? (() => {
+                                                const argName = (call.args.file_name || '').trim();
+                                                const isVideoFile = argName.length > 0 && VIDEO_EXTS.some(e => argName.toLowerCase().endsWith(e));
+                                                if (isVideoFile) {
+                                                    // User said a video filename but Gemini called open_editor — redirect to import
+                                                    return `EDITOR IS ALREADY OPEN. The user wants to ADD "${argName}" to the timeline. Call import_file(file_name='${argName}') RIGHT NOW. Do NOT call open_editor again.`;
+                                                }
+                                                const avail = scanVideoFiles().filter(f => !f.toLowerCase().includes('_movie')).slice(0, 6).join(', ');
+                                                return `EDITOR IS ALREADY OPEN. You are in FILE IMPORT MODE. ` +
+                                                       `Do NOT call open_editor again. ` +
+                                                       `Available files: ${avail || `check ${getSystemVideosFolderName()} folder`}. ` +
+                                                       `Ask the user: "Which video file would you like to add? Say the filename." ` +
+                                                       `When they say a filename, call import_file(file_name='[filename]') immediately.`;
+                                              })()
+                                            : veKey === 'play_preview'
+                                            ? `Say out loud: "Still rendering your video, please wait a moment!" Do NOT call play_preview again.`
+                                            : (action === 'import_file' || action === 'add_to_timeline')
+                                            // That file is already being processed or was just added.
+                                            // Do NOT name any files here — Gemini latches onto filenames and re-calls the tool.
+                                            ? `[ALREADY IMPORTED] That video is already on the timeline. STOP calling import_file. Say out loud: "Already added! Which other video do you want?" Then STOP completely. Do NOT call any function.`
+                                            : `already_running`;
                                         activeSession.sendRealtimeInput({
                                             functionResponses: [{ id: call.id, response: {
-                                                status: 'already_running',
-                                                message: 'This video editor action is already running. Tell the user to wait — do NOT call video_editor_action again.'
+                                                status: veKey === 'list_projects' ? 'already_shown' : 'already_running',
+                                                message: debounceMsg,
                                             }}]
                                         });
                                     } catch (_) {}
                                     return;
                                 }
                                 _videoEditorDebounce.set(veKey, nowVE);
+                                // After import_file, block add_to_timeline only for the SAME filename.
+                                // Timestamp trick: setting it 15s into the future means the 15s window
+                                // doesn't expire for 30s total — prevents Gemini retrying the same file.
+                                if (action === 'import_file') {
+                                    const crossKey = _veFileName ? `add_to_timeline:${_veFileName}` : 'add_to_timeline';
+                                    _videoEditorDebounce.set(crossKey, nowVE + (VIDEO_EDITOR_DEBOUNCE_MS.add_to_timeline || 15000));
+                                }
 
                                 console.log(`🎬 [VideoEditor] action="${action}" file="${call.args.file_name || ''}" instruction="${call.args.instruction || ''}"`);
 
@@ -2285,18 +2534,29 @@ async function startLiveSession(mainWindow, automation) {
                                     list_projects:   (() => {
                                         const projs = scanOspProjects();
                                         if (projs.length === 0) {
-                                            return `Say: "You don't have any saved projects in your Videos folder yet. Would you like to create a new one? Just tell me a project name." Do NOT call list_projects again.`;
+                                            return `Say: "You don't have any saved projects in your ${getSystemVideosFolderName()} folder yet. Would you like to create a new one? Just tell me a project name." NEVER call list_projects again.`;
                                         }
                                         const numbered = projs.map((p, i) => `${i + 1}. ${p}`).join(', ');
-                                        return `Say this out loud as a numbered list: "Here are your saved projects: ${numbered}. Which one would you like to open? Just say the number." Then call open_editor(project_mode='existing', file_name='<the chosen project name>') as soon as the user picks one. Do NOT call list_projects again.`;
+                                        return `Say: "Here are your saved projects: ${numbered}. Which one?" Wait for the user to say a number or name. The instant they do, call open_editor(project_mode='existing', file_name='<chosen name>') — do NOT call list_projects again under any circumstances.`;
                                     })(),
-                                    open_editor:     `Say out loud: "Opening your project in the video editor now!" Then listen for the user.`,
-                                    import_file:     `Say out loud: "Importing that video now!" Then listen for the result.`,
-                                    add_to_timeline: `Say out loud: "Adding that to the timeline now!" Then listen for the result.`,
-                                    delete_clip:     `Say out loud: "Deleting that clip now." Do NOT call video_editor_action again.`,
-                                    play_preview:    `Say out loud: "Playing your video preview." Do NOT call video_editor_action again.`,
-                                    stop_preview:    `Say out loud: "Stopping playback." Do NOT call video_editor_action again.`,
-                                    save_project:    `Say out loud: "Saving your project now." Do NOT call video_editor_action again.`,
+                                    open_editor:     (() => {
+                                        const isNew = call.args.project_mode === 'new' || !call.args.project_mode;
+                                        const hasName = (call.args.file_name || '').trim().length > 0;
+                                        if (isNew && !hasName) {
+                                            return `Ask the user right now: "What would you like to name your new project?" Wait for their answer. NEVER call open_editor until you have a name from the user.`;
+                                        }
+                                        // Immediate ACK — Gemini speaks the project name so user can catch errors.
+                                        // Listen briefly so user can correct the name; [EDITOR_READY] injection
+                                        // arrives in ~2s with full import-mode guidance.
+                                        return `Say out loud: "Opening project '${call.args.file_name || 'new project'}', one moment!" Listen — if the user says that name is wrong or gives a different name, acknowledge it but do NOT call open_editor again (it's already opening). Do NOT call open_editor again.`;
+                                    })(),
+                                    import_file:     `Say out loud: "Adding ${call.args.file_name || 'that video'} to your timeline, one moment!" Then wait. Do NOT call any tool.`,
+                                    add_to_timeline: `Say out loud: "Adding ${call.args.file_name || 'that clip'} to the timeline, one moment!" Then wait. Do NOT call any tool.`,
+                                    delete_clip:     `Say out loud: "Removing ${call.args.file_name || 'that clip'} from the timeline, one moment!" Then wait. Do NOT call any tool.`,
+                                    play_preview:    `Say out loud: "Rendering your movie now — this takes a few seconds!" Do NOT call any tool. Wait for the result.`,
+                                    stop_preview:    `Say out loud: "Closing the preview." Do NOT call video_editor_action again.`,
+                                    close_preview:   `Say out loud: "Closing the preview, bringing you back to the editor!" Do NOT call video_editor_action again.`,
+                                    save_project:    `Say out loud: "Saving your project! I'll use keyboard shortcuts to do it." Then wait silently for the save to complete. Do NOT call video_editor_action again.`,
                                     export_video:    `Say out loud: "Opening the export dialog to render your final video." Do NOT call video_editor_action again.`,
                                     undo:            `Say out loud: "Undoing your last action." Do NOT call video_editor_action again.`,
                                     redo:            `Say out loud: "Redoing." Do NOT call video_editor_action again.`,
@@ -2305,14 +2565,14 @@ async function startLiveSession(mainWindow, automation) {
                                 };
 
                                 // Show / update the video editor panel on key actions
-                                if (action === 'open_editor' && automationRef && automationRef.showVideoEditorPanel) {
+                                if ((action === 'list_projects' || action === 'open_editor') && automationRef && automationRef.showVideoEditorPanel) {
                                     const panelProjs = scanOspProjects();
                                     const panelVids  = scanVideoFiles();
                                     automationRef.showVideoEditorPanel({
                                         projects: panelProjs,
                                         videos:   panelVids,
-                                        currentProject: call.args.file_name || null,
-                                        status: 'Opening editor...',
+                                        currentProject: action === 'open_editor' ? (call.args.file_name || null) : null,
+                                        status: action === 'list_projects' ? 'Choose a project — say its number' : 'Opening editor...',
                                     });
                                 } else if (action === 'import_file' && automationRef && automationRef.updateVideoEditorPanel) {
                                     automationRef.updateVideoEditorPanel({ status: `Importing: ${call.args.file_name || ''}` });
@@ -2320,17 +2580,23 @@ async function startLiveSession(mainWindow, automation) {
                                     automationRef.hideVideoEditorPanel();
                                 }
 
-                                try {
-                                    activeSession.sendRealtimeInput({
-                                        functionResponses: [{
-                                            id: call.id,
-                                            response: {
-                                                status: 'ok',
-                                                message: veAckMessages[action] || `Acknowledged. Say briefly what you are doing for action: ${action}. Do NOT call video_editor_action again.`
-                                            }
-                                        }]
-                                    });
-                                } catch (_) {}
+                                // ALL actions use IMMEDIATE ACK — Gemini speaks when the user's voice
+                                // is still fresh. Audio completion cues are delivered via UI beep +
+                                // status badge (reliable) + text injection for Gemini context.
+                                const _delayFnResponse = false;
+                                if (!_delayFnResponse) {
+                                    try {
+                                        activeSession.sendRealtimeInput({
+                                            functionResponses: [{
+                                                id: call.id,
+                                                response: {
+                                                    status: 'ok',
+                                                    message: veAckMessages[action] || `Acknowledged. Say briefly what you are doing for action: ${action}. Do NOT call video_editor_action again.`
+                                                }
+                                            }]
+                                        });
+                                    } catch (_) {}
+                                }
 
                                 // list_projects is stateless — the ack already contains the full answer.
                                 // Running the async tool would fire a duplicate injection that confuses Gemini.
@@ -2348,7 +2614,14 @@ async function startLiveSession(mainWindow, automation) {
                                         const speakText = result.speak || 'Done.';
                                         let prompt;
                                         if (result.status === 'error') {
-                                            prompt = `[VIDEO EDITOR ERROR] ${speakText} Tell the user exactly this. Do NOT call any tool.`;
+                                            // Include available files in error so Gemini knows what to suggest next
+                                            const errFiles = (action === 'add_to_timeline' || action === 'delete_clip')
+                                                ? scanVideoFiles().filter(f => !f.toLowerCase().includes('_movie')).slice(0, 5).join(', ')
+                                                : '';
+                                            const errGuide = errFiles
+                                                ? ` Available files are: ${errFiles}. Ask the user which one they meant.`
+                                                : '';
+                                            prompt = `[VIDEO EDITOR ERROR] ${speakText}${errGuide} Tell the user and wait for their answer. Do NOT call any tool.`;
                                         } else if (result.status === 'debounced') {
                                             prompt = `[VIDEO EDITOR BUSY] ${speakText} Tell the user to wait. Do NOT call any tool.`;
                                         } else if (result.status === 'needs_xdotool') {
@@ -2357,38 +2630,136 @@ async function startLiveSession(mainWindow, automation) {
                                             prompt = `[PROJECT LIST] ${speakText} Say this list out loud as numbered options. Wait for the user to say a number or name, then call open_editor(project_mode='existing', file_name='<chosen>') immediately.`;
                                         } else if (action === 'open_editor') {
                                             const vf = result.video_files || [];
-                                            console.log(`🎬 [VideoEditor] Injecting EDITOR OPEN prompt`);
-                                            prompt = `[EDITOR OPEN] Say this to the user RIGHT NOW: "The editor is open! Do you need help importing a video, or would you like help editing this project?" Then wait for their answer and take action.`;
+                                            console.log(`🎬 [VideoEditor] Editor open — injecting FILE_IMPORT_MODE`);
+                                            // Build the file list so Gemini can match filenames precisely
+                                            const vfFiltered = vf.filter(f => !f.toLowerCase().includes('_movie')).slice(0, 10);
+                                            const vfList = vfFiltered.length ? vfFiltered.join(', ') : scanVideoFiles().filter(f => !f.toLowerCase().includes('_movie')).slice(0, 10).join(', ') || `check ${getSystemVideosFolderName()} folder`;
+                                            prompt = result.status === 'ok'
+                                                ? `[FILE_IMPORT_MODE] The video editor is open with project "${call.args.file_name || 'your project'}". ` +
+                                                  `You are now in FILE IMPORT MODE. ` +
+                                                  `Available video files in the ${getSystemVideosFolderName()} folder: ${vfList}. ` +
+                                                  `Say to the user (in their language): "The editor is open! Which video file would you like to add? Here are your files: ${vfList}." ` +
+                                                  `Then listen. ` +
+                                                  `The INSTANT the user says any filename from the list (in any language, even partially), ` +
+                                                  `call import_file(file_name='[exact filename with extension]') IMMEDIATELY. ` +
+                                                  `"import X" / "add X" → call import_file(file_name='X'). ` +
+                                                  `NEVER call open_editor again. You ARE in the editor. Match filenames to the list above.`
+                                                : `[EDITOR_ERROR] ${result.speak} Tell the user and ask what they want to do. Do NOT call open_editor again.`;
+                                            _videoEditorDebounce.set('open_editor', Date.now()); // full session lock
+                                            // Beep + badge tells user "editor is open, say a filename"
+                                            if (result.status === 'ok' && mainWindowRef && !mainWindowRef.isDestroyed()) {
+                                                mainWindowRef.webContents.send('play-editor-beep', 'ready');
+                                                mainWindowRef.webContents.send('video-editor-ready-cue', `🎙️ Editor open — Say a video filename`);
+                                            }
                                             if (automationRef && automationRef.updateVideoEditorPanel) {
                                                 automationRef.updateVideoEditorPanel({
                                                     videos: vf,
-                                                    status: 'Editor ready — import or edit?',
+                                                    status: 'Editor ready — tell me a filename',
                                                 });
                                             }
                                         } else if (action === 'create_project') {
-                                            prompt = `[PROJECT SAVED] ${speakText} Say this naturally, then ask: "What video files would you like to import? Just tell me the file name and I'll grab it from your Videos folder." Do NOT call any tool yet — wait for the user's answer.`;
+                                            prompt = `[PROJECT SAVED] ${speakText} Say this naturally, then ask: "What video files would you like to import? Just tell me the file name and I'll grab it from your ${getSystemVideosFolderName()} folder." Do NOT call any tool yet — wait for the user's answer.`;
                                         } else if (action === 'import_file') {
-                                            const vf2 = scanVideoFiles();
-                                            const listStr = vf2.length > 0
-                                                ? ` Videos still available: ${vf2.slice(0, 8).map((f, i) => `${i + 1}. ${f}`).join(', ')}.`
-                                                : '';
-                                            console.log(`🎬 [VideoEditor] Injecting FILE IMPORTED prompt`);
-                                            prompt = `[FILE IMPORTED] Say this to the user NOW: "${speakText}${listStr} Want to import another, or add this one to the timeline?" Then act on their answer immediately.`;
-                                        } else if (action === 'close_editor') {
-                                            prompt = `[VIDEO EDITOR CLOSED] ${speakText} Say this naturally and return to normal conversation. Do NOT call any tool.`;
-                                        } else {
-                                            prompt = `[VIDEO EDITOR ACTION DONE] ${speakText} Say this out loud, then ask what to do next. Do NOT call any tool until the user responds.`;
-                                        }
-                                        const injectDelay = 500; // fire fast — reduce echo window
-                                        setTimeout(() => {
-                                            try {
-                                                console.log(`🎬 [VideoEditor] Sending injection for ${action}: ${prompt.slice(0, 80)}...`);
-                                                if (activeSession) activeSession.sendRealtimeInput({ text: prompt });
-                                                else console.warn('🎬 [VideoEditor] No active session — injection dropped');
-                                            } catch (e) {
-                                                console.error('🎬 [VideoEditor] Failed to inject result:', e.message);
+                                            const addedName = result.file_name || call.args.file_name || '';
+                                            if (automationRef && automationRef.updateVideoEditorPanel && addedName) {
+                                                automationRef.updateVideoEditorPanel({ status: result.status === 'ok' ? `✅ Added: ${addedName}` : `❌ Error: ${addedName}` });
                                             }
-                                        }, injectDelay);
+                                            if (mainWindowRef && !mainWindowRef.isDestroyed()) {
+                                                if (result.status === 'ok') {
+                                                    // Beep + badge = reliable "done" cue independent of Gemini audio
+                                                    mainWindowRef.webContents.send('play-editor-beep', 'done');
+                                                    mainWindowRef.webContents.send('video-editor-ready-cue', `✅ ${addedName} added — Say next filename or "play"`);
+                                                } else {
+                                                    mainWindowRef.webContents.send('play-editor-beep', 'error');
+                                                }
+                                            }
+                                            // Use remaining_files from tool result — it reads the actual .osp
+                                            // to compute which files are NOT yet on the timeline, so it
+                                            // never lists files that were already added in this session.
+                                            const _remaining = (result.remaining_files || []).slice(0, 8);
+                                            const _remainStr = _remaining.join(', ');
+
+                                            // Text injection after 4s — must land AFTER ACK TTS finishes + echo tail,
+                                            // otherwise it races buffered audio and Gemini re-calls the tool.
+                                            // CRITICAL: Do NOT include "call import_file(...)" anywhere in this text.
+                                            // Explicit tool-call instructions cause Gemini to fire the tool immediately
+                                            // before the user speaks. Gemini already knows the tool; just tell it to wait.
+                                            const _addedName = addedName || call.args.file_name || 'the file';
+                                            prompt = result.status === 'ok'
+                                                ? (_remaining.length === 1
+                                                    ? `[CLIP_ADDED] ${_addedName} is now on the timeline. ` +
+                                                      `Say: "Done! Would you like to add ${_remaining[0]} as well? Say yes or no." ` +
+                                                      `WAIT for the user to respond before calling any tool. If yes: call import_file(file_name='${_remaining[0]}'). If play: play_preview. If save: save_project.`
+                                                    : _remaining.length > 1
+                                                    ? `[CLIP_ADDED] ${_addedName} is now on the timeline. Remaining: ${_remainStr}. ` +
+                                                      `Say: "Done! Which file would you like to add next? Available: ${_remainStr}." ` +
+                                                      `When the user says a filename, call import_file(file_name='[what they said]').`
+                                                    : `[CLIP_ADDED] All files are now on the timeline. ` +
+                                                      `Say: "All done! Say play to preview your movie, or save to save the project." ` +
+                                                      `Do NOT call any function.`)
+                                                : `[IMPORT_ERROR] ${speakText} Tell the user and ask which file they meant. Do NOT call any function.`;
+                                        } else if (action === 'add_to_timeline') {
+                                            _videoEditorDebounce.set('open_editor', Date.now());
+                                            const addedFileName = result.file_name || call.args.file_name || '';
+                                            if (automationRef && automationRef.updateVideoEditorPanel && addedFileName) {
+                                                automationRef.updateVideoEditorPanel({ status: result.status === 'ok' ? `Added: ${addedFileName}` : `Error adding: ${addedFileName}` });
+                                            }
+                                            // ACK already told Gemini success — only inject on error
+                                            if (result.status === 'ok' && mainWindowRef && !mainWindowRef.isDestroyed()) {
+                                                mainWindowRef.webContents.send('video-editor-ready-cue', `🎙️ Ready! Say next filename or "play"`);
+                                            }
+                                            if (result.status === 'ok') {
+                                                // Use remaining_files from tool result for accuracy
+                                                const _atRem = (result.remaining_files || []).slice(0, 6);
+                                                prompt = _atRem.length === 1
+                                                    ? `[CLIP_ADDED] ${addedFileName || 'File'} is now on the timeline. ` +
+                                                      `Say: "Done! Would you like to add ${_atRem[0]} as well? Say yes or no." WAIT for the user to respond. If yes: call import_file(file_name='${_atRem[0]}'). If play: play_preview. If save: save_project.`
+                                                    : _atRem.length > 1
+                                                    ? `[CLIP_ADDED] ${addedFileName || 'File'} is now on the timeline. Remaining: ${_atRem.join(', ')}. ` +
+                                                      `Say: "Done! Which file would you like to add next? Available: ${_atRem.join(', ')}." WAIT for the user to speak a filename. Do NOT call any tool until the user speaks.`
+                                                    : `[CLIP_ADDED] All files are on the timeline. ` +
+                                                      `Say: "All done! Say play to preview your movie, or save to save the project." ` +
+                                                      `Do NOT call any function.`;
+                                            } else {
+                                                prompt = `[VIDEO EDITOR ERROR] ${speakText} Tell the user and ask which file they meant. Do NOT call any function.`;
+                                            }
+                                        } else if (action === 'play_preview') {
+                                            prompt = `[MOVIE READY] Say this enthusiastically to the user: "${speakText}" ` +
+                                                `The video is now playing in their video player. Wait for them to say "close preview" or "done watching". Do NOT call any tool.`;
+                                        } else if (action === 'stop_preview' || action === 'close_preview') {
+                                            prompt = `[PREVIEW CLOSED] Say out loud: "${speakText}" Then listen for what they want to do next.`;
+                                        } else if (action === 'delete_clip') {
+                                            if (result.status === 'ok') {
+                                                const _allVids = scanVideoFiles().filter(f => !f.toLowerCase().includes('_movie')).slice(0, 5).join(', ');
+                                                prompt = `[CLIP_DELETED] Say: "${speakText}" Then guide: "Say a filename to add (${_allVids || `check ${getSystemVideosFolderName()} folder`}), say play to preview, or say save." Listen for their choice.`;
+                                            } else {
+                                                prompt = `[VIDEO EDITOR ERROR] ${speakText} Tell the user. Do NOT call delete_clip again.`;
+                                            }
+                                        } else if (action === 'save_project') {
+                                            prompt = result.status === 'ok'
+                                                ? `[PROJECT SAVED] Say: "${speakText}" Then ask: "Would you like to keep editing, add more clips, or shall I close the editor?" Wait for their answer. Do NOT call any tool yet.`
+                                                : `[SAVE ERROR] ${speakText} Tell the user and ask if they want to try again. Do NOT call save_project automatically.`;
+                                        } else if (action === 'close_editor') {
+                                            prompt = `[VIDEO EDITOR CLOSED] ${speakText} Say this naturally and return to normal conversation mode. Do NOT call any tool.`;
+                                        } else {
+                                            prompt = `[VIDEO EDITOR ACTION DONE] ${speakText} Say this out loud naturally, then ask what they'd like to do next. Do NOT wait silently.`;
+                                        }
+                                        if (prompt) {
+                                            // import_file: delay 4s so ACK TTS ("Adding X, one moment!") fully
+                                            // finishes AND the 2.5s echo tail expires before the injection lands.
+                                            // At 1.5s the injection raced live audio and caused Gemini to
+                                            // immediately re-call import_file — 4s gives a clean listening window.
+                                            const injectDelay = (action === 'import_file' || action === 'add_to_timeline' || action === 'delete_clip') ? 4000 : 200;
+                                            setTimeout(() => {
+                                                try {
+                                                    console.log(`🎬 [VideoEditor] Sending injection for ${action}: ${prompt.slice(0, 80)}...`);
+                                                    if (activeSession) activeSession.sendRealtimeInput({ text: prompt });
+                                                    else console.warn('🎬 [VideoEditor] No active session — injection dropped');
+                                                } catch (e) {
+                                                    console.error('🎬 [VideoEditor] Failed to inject result:', e.message);
+                                                }
+                                            }, injectDelay);
+                                        }
                                     }).catch((e) => {
                                         console.error('🎬 [VideoEditor] Unexpected error:', e.message);
                                         if (mainWindowRef && !mainWindowRef.isDestroyed()) {
@@ -2486,7 +2857,7 @@ async function startLiveSession(mainWindow, automation) {
                                         } else if (vgAction === 'delete_prompt') {
                                             injectPrompt = `[VIDEO PROMPT DELETED] ${speakText} Say this naturally. Do NOT call any tool.`;
                                         } else {
-                                            injectPrompt = `[VIDEO READY] ${speakText} Say this enthusiastically — the video is in their Videos folder and is now opening. Ask how it looks and if anything needs improving. Do NOT call any tool until they respond.`;
+                                            injectPrompt = `[VIDEO READY] ${speakText} Say this enthusiastically — the video is in their ${getSystemVideosFolderName()} folder and is now opening. Ask how it looks and if anything needs improving. Do NOT call any tool until they respond.`;
                                         }
 
                                         const delay = vgAction === 'generate' ? 1000 : 700;

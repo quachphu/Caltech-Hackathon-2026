@@ -43,52 +43,76 @@ function pcmToWav(pcmBuffer, sampleRate = 24000, numChannels = 1, bitDepth = 16)
  * @returns {Promise<string>} - The relative output path used
  */
 async function generateSpeech(text, relativeOutputPath) {
-    // Always write as .wav
     const wavOutputPath = relativeOutputPath.replace(/\.(mp3|ogg|aac)$/i, '.wav');
-    if (!wavOutputPath.endsWith('.wav')) {
-        // ensure .wav extension
-    }
     const absoluteOutputPath = path.join(__dirname, wavOutputPath);
 
-    // Ensure directory exists
     const dir = path.dirname(absoluteOutputPath);
     if (!fs.existsSync(dir)) {
         fs.mkdirSync(dir, { recursive: true });
     }
 
-    try {
+    const VOICE = 'Orus'; // Deep, resonant sci-fi voice
+
+    const tryModel = async (model, inputText = text) => {
         const response = await ai.models.generateContent({
-            model: 'gemini-2.5-flash-preview-tts',
-            contents: [{ parts: [{ text }] }],
+            model,
+            contents: [{ parts: [{ text: inputText }] }],
             config: {
                 responseModalities: ['AUDIO'],
                 speechConfig: {
                     voiceConfig: {
-                        prebuiltVoiceConfig: {
-                            voiceName: 'Orus', // Deep, resonant sci-fi voice
-                        },
+                        prebuiltVoiceConfig: { voiceName: VOICE },
                     },
                 },
             },
         });
-
-        // Extract base64 PCM audio data from the response
         const audioPart = response?.candidates?.[0]?.content?.parts?.[0];
         if (!audioPart?.inlineData?.data) {
-            throw new Error('No audio data in Gemini TTS response');
+            throw new Error('No audio data in response');
         }
+        return Buffer.from(audioPart.inlineData.data, 'base64');
+    };
 
-        const pcmBuffer = Buffer.from(audioPart.inlineData.data, 'base64');
-        const wavBuffer = pcmToWav(pcmBuffer);
+    const isQuotaError = (e) =>
+        e?.status === 429 ||
+        String(e?.message || '').includes('429') ||
+        String(e?.message || '').includes('RESOURCE_EXHAUSTED');
 
-        fs.writeFileSync(absoluteOutputPath, wavBuffer);
-        console.log('🔊 Gemini TTS: WAV written to', absoluteOutputPath);
-
-        return wavOutputPath;
+    // Stage 1: try the dedicated TTS model directly
+    let pcmBuffer = null;
+    try {
+        pcmBuffer = await tryModel('gemini-2.5-flash-preview-tts');
     } catch (e) {
-        console.error('❌ Gemini TTS Error:', e);
-        throw e;
+        if (!isQuotaError(e)) {
+            console.error('❌ TTS error on gemini-2.5-flash-preview-tts:', e.message || e);
+            return null;
+        }
+        // Stage 2 on quota: use gemini-2.5-flash to prepare the speech text,
+        // then synthesize audio with gemini-3.1-flash-preview-tts (the "pro" TTS)
+        console.warn('⚠️ Quota hit on gemini-2.5-flash-preview-tts — switching to 2.5-flash + 3.1 TTS pipeline...');
+        try {
+            const textResponse = await ai.models.generateContent({
+                model: 'gemini-2.5-flash',
+                contents: [{ parts: [{ text: `Rewrite the following for natural text-to-speech delivery. Keep the same meaning and language. Return only the rewritten text, no commentary:\n\n${text}` }] }],
+            });
+            const preparedText = textResponse.text?.trim() || text;
+            pcmBuffer = await tryModel('gemini-3.1-flash-preview-tts', preparedText);
+            console.log('🔊 TTS using fallback pipeline: gemini-2.5-flash → gemini-3.1-flash-preview-tts');
+        } catch (e2) {
+            console.error('❌ Fallback TTS pipeline failed:', e2.message || e2);
+            return null;
+        }
     }
+
+    if (!pcmBuffer) {
+        console.warn('⚠️ All Gemini TTS models exhausted — falling back to Web Speech API.');
+        return null;
+    }
+
+    const wavBuffer = pcmToWav(pcmBuffer);
+    fs.writeFileSync(absoluteOutputPath, wavBuffer);
+    console.log('🔊 Gemini TTS: WAV written to', absoluteOutputPath);
+    return wavOutputPath;
 }
 
 module.exports = { generateSpeech };

@@ -613,11 +613,65 @@ ipcRenderer.on('show-status-message', (_e, msg) => {
     if (msg) {
         _statusBadge.textContent = msg;
         _statusBadge.style.display = 'flex';
+        // Update the listening symbol with the working state — visual only, no speech blocking
+        if (listeningSymbol) {
+            listeningSymbol.innerHTML = `⚙️ ${msg}`;
+            listeningSymbol.style.display = 'block';
+        }
     } else {
         _statusBadge.style.display = 'none';
         _statusBadge.textContent = '';
+        if (listeningSymbol) listeningSymbol.style.display = 'none';
     }
 });
+
+// Video editor ready-cue — shown after Nova finishes an import/add so user knows when to speak
+ipcRenderer.on('video-editor-ready-cue', (_e, msg) => {
+    if (!_statusBadge) return;
+    _statusBadge.textContent = msg || '🎙️ Say next filename';
+    _statusBadge.style.display = 'flex';
+    window.novaState.isProcessingCommand = false;
+    if (listeningSymbol) {
+        listeningSymbol.innerHTML = msg || '🎙️ Say next filename';
+        listeningSymbol.style.display = 'block';
+    }
+    // Auto-clear after 6s so it doesn't persist forever
+    setTimeout(() => {
+        if (_statusBadge && _statusBadge.textContent === (msg || '🎙️ Say next filename')) {
+            _statusBadge.style.display = 'none';
+            if (listeningSymbol) listeningSymbol.style.display = 'none';
+        }
+    }, 6000);
+});
+
+// Audio beep cue — reliable non-Gemini audio feedback for video editor events.
+// 'done'  = upward ding (clip added)
+// 'ready' = soft chime (editor open)
+// 'error' = low buzz
+function _playEditorBeep(type) {
+    try {
+        const ctx = new AudioContext();
+        const osc = ctx.createOscillator();
+        const gain = ctx.createGain();
+        osc.connect(gain);
+        gain.connect(ctx.destination);
+        if (type === 'done') {
+            osc.frequency.setValueAtTime(660, ctx.currentTime);
+            osc.frequency.linearRampToValueAtTime(880, ctx.currentTime + 0.15);
+        } else if (type === 'ready') {
+            osc.frequency.setValueAtTime(523, ctx.currentTime);
+            osc.frequency.linearRampToValueAtTime(659, ctx.currentTime + 0.2);
+        } else {
+            osc.frequency.setValueAtTime(200, ctx.currentTime);
+        }
+        gain.gain.setValueAtTime(0.3, ctx.currentTime);
+        gain.gain.exponentialRampToValueAtTime(0.001, ctx.currentTime + 0.3);
+        osc.start(ctx.currentTime);
+        osc.stop(ctx.currentTime + 0.3);
+        osc.onended = () => ctx.close();
+    } catch (_) {}
+}
+ipcRenderer.on('play-editor-beep', (_e, type) => _playEditorBeep(type));
 
 // Image generation visual state — purple creative pulse on the robot + tinted badge
 const _widget = document.getElementById('widget');
@@ -986,11 +1040,14 @@ async function initOfflineVoice() {
         let audioQueue = [];
         let isPlayingLive = false;
         let livePlaybackStuckTimer = null;       // Watchdog for stuck isPlayingLive
+        let _speakingEndedAt = 0;                // Timestamp when TTS last finished — gates echo tail
+        const ECHO_TAIL_MS = 2500;               // Block mic for 2.5s after TTS ends — enough for Nova to start next sentence
         const livePlaybackContext = new window.AudioContext({ sampleRate: 24000 });
 
         function resetLivePlayback() {
             isPlayingLive = false;
             window.novaState.isSpeaking = false;
+            _speakingEndedAt = Date.now(); // start echo-tail gate
             listeningSymbol.style.display = 'none';
             if (livePlaybackStuckTimer) { clearTimeout(livePlaybackStuckTimer); livePlaybackStuckTimer = null; }
         }
@@ -1168,12 +1225,15 @@ async function initOfflineVoice() {
                                     window._lastSilenceLog = Date.now();
                                 }
                             }
+                            
                         }
                     }
 
                     // Route out Float32 PCM arrays into 16kHz Int16 for Gemini
                     // Block audio during research so Nova isn't interrupted by voice commands
-                    if (!window.novaState.isSpeaking && !window.novaState.isResearching) {
+                    // Also block for ECHO_TAIL_MS after TTS ends to prevent acoustic echo from triggering tools
+                    if (!window.novaState.isSpeaking && !window.novaState.isResearching &&
+                        (Date.now() - _speakingEndedAt > ECHO_TAIL_MS)) {
                         const pcm = new Int16Array(data.length);
                         for (let i = 0; i < data.length; i++) {
                             let s = Math.max(-1, Math.min(1, data[i]));
@@ -1218,13 +1278,24 @@ setTimeout(async () => {
         const audioPath = await ipcRenderer.invoke('generate-speech',
             "Nova online. I am your personal AI assistant. " +
             "Say Hey Nova at any time to start a conversation with me in any language.");
-        if (!audioPath) { console.warn('[Nova Startup] No audio path'); return; }
+        if (!audioPath) {
+            console.warn('[Nova Startup] TTS unavailable — using Web Speech fallback.');
+            if (novaWidget) novaWidget.classList.remove('offline');
+            if ('speechSynthesis' in window) {
+                const utt = new SpeechSynthesisUtterance(
+                    "Nova online. I am your personal AI assistant. " +
+                    "Say Hey Nova at any time to start a conversation with me."
+                );
+                utt.rate = 0.9;
+                window.speechSynthesis.speak(utt);
+            }
+            return;
+        }
         const audio = new Audio();
         audio.addEventListener('loadeddata', () => {
             audio.play()
                 .then(() => {
                     console.log('[Nova Startup] Intro playing.');
-                    // Power-on: remove offline state so orb comes alive with its full colors
                     if (novaWidget) novaWidget.classList.remove('offline');
                 })
                 .catch(err => console.error('[Nova Startup] play() failed:', err));
@@ -1232,7 +1303,6 @@ setTimeout(async () => {
         audio.addEventListener('ended',  () => console.log('[Nova Startup] Intro finished.'));
         audio.addEventListener('error',  (e) => {
             console.error('[Nova Startup] Audio error:', e.target?.error?.code);
-            // Still power-on even if audio fails so the UI isn't stuck offline
             if (novaWidget) novaWidget.classList.remove('offline');
         });
         audio.src = `appassets:///${audioPath}`;

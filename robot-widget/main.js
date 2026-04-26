@@ -368,10 +368,11 @@ function createChatWindow() {
 let browserWin = null;
 let isBrowserReady = false;
 let pendingBrowserUrl = null;
-let calendarWin     = null;
-let notesWin        = null;
-let contactsWin     = null;
-let videoEditorWin  = null;
+let calendarWin      = null;
+let notesWin         = null;
+let contactsWin      = null;
+let attachmentsWin   = null;
+let videoEditorWin   = null;
 
 ipcMain.on('browser-ready', () => {
     console.log('📡 Bridge: Browser Agent is ready.');
@@ -863,6 +864,47 @@ const Automation = {
         }
     },
 
+    showAttachmentsPanel: (files, fileType) => {
+        const W = 320, H = 420;
+        const { width: sw, height: sh } = screen.getPrimaryDisplay().workAreaSize;
+        const novaW = 130, gap = 12;
+        const panelX = Math.max(8, sw - novaW - gap - W);
+        const panelY = Math.max(8, sh - H - 8);
+
+        if (attachmentsWin && !attachmentsWin.isDestroyed()) {
+            attachmentsWin.webContents.send('attachments-data', { files, fileType });
+            return;
+        }
+        attachmentsWin = new BrowserWindow({
+            width: W, height: H, x: panelX, y: panelY,
+            transparent: true, frame: false, hasShadow: false,
+            alwaysOnTop: true, skipTaskbar: true, resizable: false,
+            ...(process.platform === 'linux' ? { type: 'toolbar' } : {}),
+            webPreferences: { nodeIntegration: true, contextIsolation: false }
+        });
+        attachmentsWin.setAlwaysOnTop(true, 'screen-saver');
+        attachmentsWin.loadFile(path.join(__dirname, 'attachments_panel.html'));
+        attachmentsWin.once('ready-to-show', () => {
+            attachmentsWin.show();
+            setTimeout(() => {
+                if (attachmentsWin && !attachmentsWin.isDestroyed()) {
+                    attachmentsWin.webContents.send('attachments-data', { files, fileType });
+                }
+            }, 150);
+        });
+        attachmentsWin.on('closed', () => { attachmentsWin = null; });
+    },
+
+    highlightAttachment: (index, name) => {
+        if (attachmentsWin && !attachmentsWin.isDestroyed()) {
+            attachmentsWin.webContents.send('attachment-selected', { index, name });
+        }
+    },
+
+    hideAttachmentsPanel: () => {
+        if (attachmentsWin && !attachmentsWin.isDestroyed()) attachmentsWin.close();
+    },
+
     closeBrowser: () => {
         if (browserWin && !browserWin.isDestroyed()) {
             browserWin.close();
@@ -1285,6 +1327,10 @@ ipcMain.on('notes-panel-hide', () => {
 
 ipcMain.on('contacts-panel-hide', () => {
     Automation.hideContactsPanel();
+});
+
+ipcMain.on('attachments-panel-hide', () => {
+    Automation.hideAttachmentsPanel();
 });
 
 ipcMain.on('notes-panel-open-note', (event, title) => {
