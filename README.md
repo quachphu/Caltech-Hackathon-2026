@@ -15,6 +15,7 @@ Nova is an **AI agent** that learns and executes workflows across any software o
 | **Website**                         | <https://novatechai.tech/>                                                             |
 | **User survey & interview (video)** | <https://drive.google.com/drive/folders/1NNDNxvJNhKSiK3H5IQRu4VVMeUfwyzjj?usp=sharing> |
 | **Slide deck**                      | <https://canva.link/r1t51is1wwdz4qe>                                                   |
+| **Video Demo**                      | <https://youtu.be/wt_w_KeJC2E>                                                         |
 
 ---
 
