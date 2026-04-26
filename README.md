@@ -17,7 +17,7 @@ Nova is an **AI agent** that learns and executes workflows across any software o
 | **Slide deck**                      | <https://canva.link/r1t51is1wwdz4qe>                                                   |
 | **Video Demo**                      | <https://youtu.be/wt_w_KeJC2E>                                                         |
 
-## **Nova is live on your desktop. On macOS, Windows, and Linux. Ready for anyone to use.**
+**Nova is live on your desktop. On macOS, Windows, and Linux. Ready for anyone to use.**
 
 ## Architecture
 
