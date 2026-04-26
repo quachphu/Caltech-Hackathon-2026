@@ -1,932 +1,1125 @@
 # Caltech-Hackathon-2026
 
-# Nova — AI Voice Assistant for Desktop Automation
+# Nova AI — Complete Implementation Reference
 
-Nova is a **sci-fi AI voice assistant** that lives as a transparent animated orb on your desktop. Powered by **Google Gemini**, Nova listens to your voice in real time, understands natural language, and autonomously controls your entire desktop — opening browsers, sending emails, managing your calendar, writing and running code projects, checking stocks, and much more.
-
----
-
-## Preview
-
-<p align="center">
-  <img src="robot-widget/assets/novaPreview1.png" width="250" alt="Nova UI Preview 1" />
-  <img src="robot-widget/assets/novaPreview2.png" width="250" alt="Nova UI Preview 2" />
-  <img src="robot-widget/assets/novaPreview3.png" width="250" alt="Nova UI Preview 3" />
-</p>
-<p align="center">
-  <img src="robot-widget/assets/novaPreview4.png" width="250" alt="Nova UI Preview 4" />
-  <img src="robot-widget/assets/novaPreview5.png" width="250" alt="Nova UI Preview 5" />
-  <img src="robot-widget/assets/novaPreview6.png" width="250" alt="Nova UI Preview 6" />
-</p>
+> **For any AI or developer debugging or continuing this project:** This document is the ground truth. Read it fully before touching any code. It describes every system, every critical invariant, every known failure mode, and the exact design decisions made after extensive debugging. Violating any of the invariants here will break things in non-obvious ways.
 
 ---
 
 ## Table of Contents
 
-1. [How It Works](#how-it-works)
+1. [What is Nova?](#what-is-nova)
 2. [Architecture Overview](#architecture-overview)
-3. [File Structure](#file-structure)
-4. [Features](#features)
-5. [System Requirements](#system-requirements)
-6. [Installation & Setup](#installation--setup)
-7. [Google Services Setup (Gmail + Calendar)](#google-services-setup-gmail--calendar)
-8. [Running Nova](#running-nova)
-9. [First Launch](#first-launch)
-10. [Example Voice Commands](#example-voice-commands)
-11. [Tech Stack](#tech-stack)
-12. [Rebuilding from Scratch (Claude Reference)](#rebuilding-from-scratch-claude-reference)
+3. [How to Run](#how-to-run)
+4. [Environment & Dependencies](#environment--dependencies)
+5. [File Map](#file-map)
+6. [Core Pipeline: Voice → Gemini → Action](#core-pipeline-voice--gemini--action)
+7. [Gemini Live API — Critical Invariants](#gemini-live-api--critical-invariants)
+8. [Feature: Video Editor](#feature-video-editor)
+9. [Feature: Email with Attachments](#feature-email-with-attachments)
+10. [Feature: Calendar](#feature-calendar)
+11. [Feature: Code Agent](#feature-code-agent)
+12. [Feature: AI Image Generation](#feature-ai-image-generation)
+13. [Feature: AI Video Generation](#feature-ai-video-generation)
+14. [Feature: Browser Control](#feature-browser-control)
+15. [Feature: Notes](#feature-notes)
+16. [Feature: Research Paper Generation](#feature-research-paper-generation)
+17. [Feature: Stock Charts](#feature-stock-charts)
+18. [Feature: Macro Recording](#feature-macro-recording)
+19. [Feature: Screen Analysis](#feature-screen-analysis)
+20. [Debounce Architecture](#debounce-architecture)
+21. [UI: The Orb & Motion Engine](#ui-the-orb--motion-engine)
+22. [Known Failure Modes & Fixes](#known-failure-modes--fixes)
+23. [Platform Notes](#platform-notes)
+24. [Quick Debug Checklist](#quick-debug-checklist)
 
 ---
 
-## How It Works
+## What is Nova?
 
-Nova is built on four tightly integrated layers:
+Nova is a **desktop AI assistant** built with Electron. It renders as a small glowing orb pinned to the bottom-right corner of the screen, always on top of all windows. The user speaks to it via microphone; it listens using Vosk (offline English STT for wake-word/trigger detection in the UI), forwards raw audio to Gemini Live API for real-time multilingual understanding, and executes tool calls (email, video editing, calendar, code, browser automation, etc.) in response to voice commands.
 
-### 1. Voice Input (Local + Streaming)
-
-**Offline recognition (Vosk):**  
-Nova runs a local 40 MB Kaldi acoustic model (`vosk-browser`) directly in the Electron renderer. It captures your microphone at 16 kHz mono and continuously produces partial and final transcripts — all on-device, with zero latency and zero data leaving your machine. Both English (`vosk-model/`) and Spanish (`vosk-model-es/`) models are included.
-
-**Wake word / activation:**  
-When Vosk detects your wake phrase (e.g. _"Hey Nova"_ or _"Nova"_), it wakes the assistant and starts streaming raw PCM audio to the Gemini Live session.
-
-**Gemini Live streaming:**  
-Once awake, every mic audio chunk is base64-encoded and piped over IPC (`live-audio-chunk`) to the main process, which forwards it in real time to **`gemini-3.1-flash-live-preview`** via the Gemini Multimodal Live WebSocket API. The session receives audio turns and emits audio replies + optional tool calls. The session auto-sleeps after 5 minutes of silence and reconnects on unexpected drops while the assistant is awake.
-
----
-
-### 2. AI Brain (Google Gemini)
-
-Nova uses several Gemini models for different tasks:
-
-| Task                                 | Model                                          | File            |
-| ------------------------------------ | ---------------------------------------------- | --------------- |
-| Real-time voice conversation + tools | `gemini-3.1-flash-live-preview`                | `live.js`       |
-| Text chat with conversation history  | `gemini-2.5-flash`                             | `gemini.js`     |
-| Text-to-speech synthesis             | `gemini-2.5-flash-preview-tts`                 | `tts.js`        |
-| Audio transcription (batch)          | `gemini-2.5-flash`                             | `stt.js`        |
-| Research paper generation            | `gemini-2.5-pro` → fallback `gemini-2.5-flash` | `main.js`       |
-| Natural language time parsing        | `gemini-2.5-flash`                             | `calendar.js`   |
-| Code generation / modification       | `gemini-2.5-flash`                             | `code_agent.js` |
-| AI video generation                  | Google Veo (`veo-2.0-generate-001`)            | `video_gen.js`  |
-
-**System identity:**  
-Gemini is given a comprehensive system prompt defining Nova as an autonomous desktop assistant. During a live session, the model can both speak back (audio response) and call desktop-control tools in the same turn.
-
-**Cooldown / debounce guards:**  
-`live.js` uses three separate debounce maps to prevent Gemini from looping tool calls triggered by ambient audio:
-
-- `lastExecCommandMap` — 15 s per-command cooldown for `execute_system_command`
-- `_codeAgentDebounce` — per-action cooldowns (generate=120 s, modify=60 s, others=10–15 s)
-- `_calendarDebounce` — 12 s per-calendar-key cooldown
-- Research paper: 10-minute cooldown after completion in both `live.js` and `renderer.js`
-- Browser close: 10 s lockout after explicit close; browser actions blocked for 2 min after a paper opens
-
----
-
-### 3. Desktop Automation Engine
-
-When Gemini decides to take an action, it emits a **function call**. Nova's `live.js` handles these tool calls and executes them on your machine via the `Automation` class defined in `main.js`.
-
-#### Browser Control (`control_browser` tool)
-
-- **open** — Resolves a search query or URL and loads it in the built-in Nova Browser Agent window (Electron `<webview>` inside `browser.html`).
-- **scroll** — Injects scroll actions (up/down/top/bottom) into the active webview.
-- **smart_click** — Reads the live DOM map of the page (element text + tag) and clicks elements by visible text using fuzzy matching.
-- **search_youtube** — Opens YouTube with the given query.
-- **toggle_incognito** — Switches the embedded browser into or out of incognito mode.
-- **close** — Hides the browser window.
-- **Store Assistant Mode** — When the loaded URL matches a known shopping domain (Apple, Amazon, eBay, Best Buy, Nike, etc.), Nova automatically enters Store Mode: it scans the DOM, describes the visible products out loud, and guides the user through navigation → selection → add-to-cart with stuck-navigation detection.
-
-#### OS & App Control (`execute_system_command` tool)
-
-- **Open / close apps** — Uses `osascript` (macOS), PowerShell (Windows), or `xdg-open`/`xdotool`/`wmctrl` (Linux) to launch and quit applications by name. A 30+ app alias map covers common names like "zoom", "vscode", "terminal", "discord", etc.
-- **Volume control** — `pactl set-sink-volume` on Linux, `osascript` on macOS, PowerShell on Windows.
-- **Media keys** — Play/pause, next/previous track via `playerctl` on Linux.
-- **Run shell commands** — Executes arbitrary terminal commands; result returned to AI.
-- **Screenshot + vision** — Captures the screen via Electron `desktopCapturer`, sends PNG base64 to Gemini for visual analysis.
-
-#### Research & Content Generation (`create_research_paper` tool)
-
-- Triggered **only** by explicit creation verbs ("write/create/generate/make") + the words "research paper" + a topic.
-- 4 academic web searches via Gemini's `googleSearch` grounding tool → `gemini-2.5-pro` (with 2× retry + fallback to flash on 503) writes a full APA-formatted HTML paper → saved to the user's Desktop → opened in Nova's browser.
-- `global.novaIsResearching` flag blocks duplicate triggers. 10-minute cooldown after completion.
-
-#### Stock Charts (`show_stock_chart` tool)
-
-- Queries Yahoo Finance REST API for real-time price, 3-month daily close data, 52-week range, and volume.
-- Opens a floating transparent 340×340 `stock.html` window (canvas chart) in the top-left corner.
-- Nova automatically moves to the top-right corner while the chart is open (so neither element overlaps).
-- If no ticker symbol is known, queries Yahoo Finance search to resolve company name → symbol.
-
----
-
-### 4. Google Services Layer
-
-#### Gmail (`gmail.js`)
-
-Nova can compose and send emails via voice. It uses OAuth2 (`google_auth.js`) to authenticate with your Gmail account. Key capabilities:
-
-- **Send emails** — Compose and send by voice: _"Send an email to Bryan about the meeting tomorrow"_
-- **Contact resolution** — Searches your sent mail history to resolve a person's name to their email address (no manual contacts list needed). Runs three Gmail search queries (`to:"name"`, `from:"name"`, full text in sent) and ranks results by frequency.
-- **Draft mode** — Pass `draft_only: true` to save as a Gmail draft instead of sending immediately.
-
-#### Google Calendar (`calendar.js`)
-
-Nova manages your calendar entirely by voice using the Google Calendar API:
-
-- **Get events** — _"What's on my calendar this week?"_ — Uses Gemini to parse natural language time expressions (e.g. _"next Friday"_, _"this month"_) into ISO 8601 date ranges. Default: "this week".
-- **Create events** — _"Schedule a meeting with John tomorrow at 3pm"_ — Conflict detection built in; alerts if another event overlaps.
-- **Delete events** — _"Cancel my dentist appointment"_ — Fuzzy-matches the event title by searching within the given time window.
-- **Check availability** — _"Am I free Thursday afternoon?"_ — Scans 8am–8pm and returns free windows.
-- **Calendar UI panel** — A glassmorphism floating panel (`calendar_panel.html`) shows today's events at a glance; voice or click to open. The panel is its own `BrowserWindow` with `nodeIntegration` and calls `ipcRenderer.invoke('calendar-get-events')` on load.
-
-#### Video Editor (`video_editor.js`)
-
-Nova integrates with **OpenShot Video Editor** for a fully hands-free video editing workflow:
-
-- **open_editor** — Kills any existing OpenShot instance, writes a minimal valid `.osp` project file (HD 720p 30fps, 5 layers, 5-minute timeline), and relaunches OpenShot with it loaded. Auto-names the project `Nova_Edit_<date>` if no name is given. On open, scans the Videos/Movies folder and reports available video files.
-- **list_projects** — Lists all `.osp` project files in the system Videos/Movies folder. Supports both exact and fuzzy name matching.
-- **import_file** — Closes OpenShot, uses `ffprobe` to extract real video metadata (resolution, FPS, duration, codecs), injects a full file entry directly into the `.osp` JSON file, then reopens OpenShot with the updated project. No import dialogs — no mouse clicks required.
-- **add_to_timeline** — Closes OpenShot, appends a complete clip entry to the `.osp` timeline (auto-positions at end of existing clips on layer 1), then reopens. Supports fuzzy file matching by name or path.
-- **delete_clip** — Sends the `Delete` key to the focused OpenShot window via `xdotool` (Linux), AppleScript (macOS), or WScript.Shell (Windows).
-- **play_preview** / **stop_preview** — Toggles playback by sending `Space` to OpenShot.
-- **save_project** — Sends `Ctrl+S` to OpenShot.
-- **export_video** — Sends `Ctrl+Shift+E` to open the Export Video dialog. Guides the user through format selection and rendering.
-- **undo** / **redo** — Sends `Ctrl+Z` / `Ctrl+Y` to OpenShot.
-- **guide** — Reports whether OpenShot is open and whether `xdotool` is available for full automation.
-- **close_editor** — Quits OpenShot, clears all session state and debounce maps.
-
-All project files are `.osp` (OpenShot JSON format) stored in the system Videos folder (`~/Movies` on macOS, `~/Videos` on Linux/Windows). Nova edits the project file directly between OpenShot sessions — no GUI interaction needed for import or timeline operations. Cross-platform keystroke delivery uses `xdotool` (Linux), `osascript` (macOS), and `PowerShell`/`WScript.Shell` (Windows). Each action has its own debounce window (3–60 seconds) to prevent Gemini from looping calls.
-
-**Video Editor Panel (`video_editor_panel.html`):** A floating glassmorphism UI panel that appears in Video Editor Mode. It lists all saved `.osp` projects, shows video files detected in the Videos folder, highlights the currently active project, and displays a live action status line. Styled with Nova's dark purple aesthetic (`rgba(6,8,18,0.97)` background, `rgba(120,80,255,0.30)` border, slide-in animation). Updates via `ipcRenderer.on('video-editor-panel-data')` IPC events.
-
-#### Video Generation (`video_gen.js`)
-
-Nova can generate original AI videos from a voice description using **Google Veo 2.0**:
-
-- **Generate** — Builds a structured prompt from up to 7 creative parameters (subject, style, setting, characters, dialogue/script, camera style, color/mood) plus quality boosters (8-second shot, 4K, cinematic composition, no jump cuts). Submits to `veo-2.0-generate-001` via `predictLongRunning`, then polls every 8 seconds for up to ~6 minutes. Downloads video bytes (base64 or URI), saves as `Nova_<slug>_<timestamp>.mp4` to the Videos folder, and auto-opens both the folder and the video player.
-- **Styles** — Six built-in style presets: `cinematic` (Hollywood depth-of-field, dramatic color grading), `animated` (3D studio rendering, fluid motion), `documentary` (naturalistic handheld, observational), `nature` (David Attenborough macro, pristine lighting), `sci-fi` (futuristic neon, otherworldly atmosphere), `commercial` (polished aspirational look).
-- **Aspect ratios** — `landscape` (16:9), `portrait` (9:16), `square` (1:1).
-- **Prompt cache** (`~/Nova/video_prompts/`) — Every generated video's prompt is saved as a JSON record (`vp_<timestamp>.json`) with title, raw prompt text, and full expanded prompt. Nova can list cached prompts, reuse them, or delete by ID.
-- **list_prompts** — Returns up to 8 recent prompts with titles, IDs, and creation dates so the user can reuse or improve previous generations.
-- **delete_prompt** — Removes a prompt record by ID from the local cache.
-
-The video generation tool has a 2-minute debounce (`VIDEO_GEN_DEBOUNCE_MS = 120000`) since generation takes 2–5 minutes. An in-flight mutex (`_videoGenInFlight`) prevents duplicate concurrent submissions.
-
-#### Code Agent (`code_agent.js`)
-
-Nova can build full coding projects from scratch entirely by voice:
-
-- **start_session** — Activates code agent mode; announces it to the user.
-- **list_projects** — Lists all folder names on the user's Desktop (reads via `fs.readdirSync`).
-- **create_project** — Creates a new folder on the Desktop with a sanitized name. Stores path in `_projectPath`.
-- **open_project** — Fuzzy-matches a project name against Desktop folders (score 0–100, threshold 50). Opens VS Code via `code --new-window <path>` (cross-platform). Auto-detects and starts an existing dev server.
-- **generate_code** — Asks Gemini to return a JSON map of `{ "filename": "content" }` for all project files. Writes them all to disk. Starts the appropriate dev server (`vite` for React, built-in `http.Server` for static, `node src/index.js` for APIs). Opens a live preview in Nova's browser.
-- **modify_code** — Reads all existing source files via `readProjectFiles()` (walks the directory, skips `node_modules`/`dist`/`.git`). Asks Gemini to return only the changed files as JSON. Overwrites them and hot-reloads the preview.
-- **preview_project** — Opens or re-opens the browser at the running dev server URL.
-- **end_session** — Closes VS Code, stops dev server processes, closes the browser window.
-
-**Supported project types:** `static_website` (HTML+CSS+JS), `react` (Vite+React 18+TypeScript), `api_only` (Express 4), `fullstack` (React frontend + Express backend with `concurrently`), `cli` (Node.js CLI with Commander), `extension` (Chrome Extension Manifest V3), `python`.
+**Key design principle:** Nova is voice-first. Everything goes through Gemini Live API's audio stream. Vosk is only for local trigger detection and UI feedback — Gemini does all real speech understanding. This is why Spanish, Portuguese, and other languages work even though Vosk only understands English.
 
 ---
 
 ## Architecture Overview
 
 ```
-┌─────────────────────────────────────────────────────────────────────┐
-│                        Electron Main Process                        │
-│  main.js                                                            │
-│  ├── Protocol handler (appassets://)                                │
-│  ├── IPC router (all ipcMain.on / ipcMain.handle endpoints)         │
-│  ├── Expressive Movement Engine (wander, snap-home, stock-mode)     │
-│  ├── Browser Agent window (browser.html — <webview> + DOM map)      │
-│  ├── Stock chart window (stock.html + Yahoo Finance REST API)       │
-│  ├── Calendar panel window (calendar_panel.html)                    │
-│  ├── Chat window (chat.html + chat.js)                              │
-│  ├── Research paper generator (gemini-2.5-pro + googleSearch)      │
-│  ├── Desktop automation (open apps, volume, media, screenshot)      │
-│  ├── Google Auth (google_auth.js — OAuth2 token management)         │
-│  ├── Gmail integration (gmail.js — send mail, contact lookup)       │
-│  ├── Calendar integration (calendar.js — CRUD + availability)       │
-│  ├── Code Agent (code_agent.js — generate, modify, preview)        │
-│  ├── Video Editor (video_editor.js — OpenShot .osp + keystroke)    │
-│  └── Video Generation (video_gen.js — Veo 2.0, prompt cache)       │
-│                                                                     │
-│  live.js ──── Gemini Multimodal Live WebSocket session              │
-│               └── Tool call dispatcher (10 tools, 50+ actions)    │
-│  gemini.js ── Gemini text chat with rolling 38-turn history         │
-│  tts.js ───── Gemini TTS (PCM → WAV, "Orus" voice profile)         │
-│  stt.js ───── Gemini batch audio transcription (WebM → text)       │
-└──────────────────────────┬──────────────────────────────────────────┘
-                           │ IPC (ipcMain / ipcRenderer)
-┌──────────────────────────▼──────────────────────────────────────────┐
-│                      Electron Renderer Process                      │
-│  index.html + renderer.js                                           │
-│  ├── Animated CSS orb (transparent 120×120 overlay widget)         │
-│  │    States: offline → idle → listening → thinking → speaking      │
-│  ├── Vosk — offline 16 kHz mic → wake word detection               │
-│  │    English model: vosk-model/   Spanish: vosk-model-es/          │
-│  ├── Gemini Live audio stream → IPC → main process                 │
-│  └── novaState poll → orb CSS class every 100 ms                   │
-└─────────────────────────────────────────────────────────────────────┘
-
-Key IPC channels (renderer → main):
-  drag-start / drag-move / drag-end      Widget dragging
-  nova-bounce-start / stop               Wander motion on/off
-  nova-move-state  (mode)                listening | speaking | thinking
-  live-start / live-audio-chunk / live-end  Gemini Live audio pipeline
-  open-chat                              Open text chat window
-  browser-get-map                        Request DOM snapshot from webview
-  dom-map-available                      Webview sends back element map
-
-Key IPC channels (main → renderer):
-  live-audio-response  (base64)          Play Gemini audio reply
-  nova-speak           (text)            TTS playback trigger
-  automation-log       (message)         Status updates in overlay
-
-Key IPC handles (invoke):
-  generate-speech      (text)            → tts.js → WAV file path
-  ask-grok             (text)            → gemini.js → reply text
-  calendar-get-events                    → calendar.js → events array
-  open-calendar-panel                    → creates calendarWin
-  coding-done          (payload)         → code agent result to renderer
+User speaks
+    ↓
+[renderer.js] — Captures mic via Web Audio API at 16kHz mono PCM
+    ↓ (PCM audio chunks over IPC)
+[main.js] — Bridges renderer ↔ live session
+    ↓
+[live.js] — Gemini Live API (WebSocket bidirectional)
+    ↓
+Gemini interprets speech, calls tools
+    ↓
+Tool handlers:
+  video_editor.js, gmail.js, calendar.js, code_agent.js,
+  image_gen.js, video_gen.js, notes.js, gemini.js
+    ↓
+Results injected back via sendRealtimeInput({ text: ... }) or functionResponses
+    ↓
+Gemini generates TTS audio
+    ↓
+[renderer.js] — Plays audio, updates orb animation
 ```
 
----
+### Two-layer STT architecture
 
-## File Structure
+Nova runs **two speech recognizers simultaneously**:
 
-```
-NovaAI/
-└── robot-widget/
-    ├── main.js               Electron main — IPC router, all windows, automation, research paper
-    ├── renderer.js           Renderer — CSS orb states, Vosk wake word, Gemini Live audio pipeline
-    ├── live.js               Gemini Live session (gemini-3.1-flash-live-preview) + 10 tool handlers
-    ├── gemini.js             Gemini text chat (gemini-2.5-flash, rolling 38-turn history)
-    ├── tts.js                Gemini TTS (gemini-2.5-flash-preview-tts) → raw PCM → WAV file
-    ├── stt.js                Gemini batch transcription — WebM buffer → text string
-    ├── google_auth.js        Google OAuth2 — token load/save/refresh, isAuthenticated guard
-    ├── gmail.js              Gmail API — send mail, contact name → email lookup
-    ├── calendar.js           Google Calendar API — CRUD events, availability, NL time parse
-    ├── code_agent.js         Code Agent — project scaffold, modify, VS Code, dev server, preview
-    ├── video_editor.js       OpenShot integration — .osp project editor + cross-platform keystrokes
-    ├── video_gen.js          Veo 2.0 video generation — prompt builder, polling, prompt cache
-    ├── index.html            Main overlay window — animated orb CSS + widget markup
-    ├── browser.html          Nova Browser Agent — Electron <webview> + DOM map injector
-    ├── chat.html             Text "Comms" chat window markup
-    ├── chat.js               Chat window renderer — sends to Gemini, plays TTS reply
-    ├── calendar_panel.html   Floating calendar UI panel (glassmorphism design)
-    ├── video_editor_panel.html  Floating Video Editor Mode panel (projects + files list)
-    ├── stock.html            Floating stock chart window (canvas-based chart)
-    ├── package.json          Electron app config + npm scripts + dependencies
-    ├── .env                  API keys (not committed — see setup below)
-    ├── scripts/
-    │   └── setup_google_auth.js   Interactive Google OAuth2 setup wizard
-    ├── credentials/
-    │   └── google_token.json      Saved OAuth token (auto-created after setup)
-    ├── assets/
-    │   ├── novaPreview1-6.png     UI screenshots used in this README
-    │   └── voice/                 TTS audio cache (response_N.wav, rotated 0–11)
-    ├── vosk-model/                English offline speech recognition model (~40 MB)
-    └── vosk-model-es/             Spanish offline speech recognition model
-```
+| Layer                  | What                        | Why                                                                |
+| ---------------------- | --------------------------- | ------------------------------------------------------------------ |
+| Vosk (in-browser WASM) | English STT, always-on      | Local, zero latency, shows live transcript in UI as debug feedback |
+| Gemini Live API        | Multilingual, streaming PCM | Real understanding — hears raw audio, no transcription needed      |
+
+Vosk transcriptions are shown in the UI but are NOT what Gemini acts on. Gemini hears the raw audio. This is why multilingual commands work even when Vosk shows garbled English text.
 
 ---
 
-## Features
-
-| Feature                      | Description                                                                                  |
-| ---------------------------- | -------------------------------------------------------------------------------------------- |
-| Real-time voice conversation | Gemini Multimodal Live WebSocket — speak and get spoken replies                              |
-| Offline wake word            | Local Vosk model (English + Spanish) — no cloud round-trip for wake detection                |
-| Full browser control         | Open, navigate, scroll, smart-click, incognito toggle, close — all by voice                  |
-| Store Assistant Mode         | Auto-activates on 20+ shopping sites — guides browse → select → add-to-cart                  |
-| Desktop app control          | Open/close/focus any app on macOS, Windows, and Linux                                        |
-| Volume & media control       | Set volume, play/pause, next/previous track                                                  |
-| Shell command execution      | Run any terminal command, result returned to AI                                              |
-| Screen vision                | Screenshot → Gemini describes what's on your screen                                          |
-| Gmail integration            | Send emails by voice with automatic contact name resolution                                  |
-| Google Calendar              | Get, create, delete events; check free slots; natural language time parsing                  |
-| Calendar UI panel            | Floating glassmorphism panel showing today's schedule                                        |
-| Code Agent                   | Generate full projects (React, Python, HTML, etc.) with live preview in VS Code              |
-| Stock charts                 | Real-time price + 3-month chart via Yahoo Finance (no API key needed)                        |
-| Research paper generation    | Web-grounded Gemini writes an HTML paper saved to your Desktop                               |
-| **AI Video Generation**      | **Google Veo 2.0 — generate 8-second 4K clips from voice descriptions with 6 style presets** |
-| **Video Editor Control**     | **Voice-control OpenShot: import files, build timelines, preview, export — no mouse needed** |
-| **Video Editor Panel**       | **Floating dark UI showing saved projects, Videos folder contents, and live action status**  |
-| **Video Prompt Cache**       | **Saves generation prompts locally for reuse, iteration, and improvement**                   |
-| Gemini TTS                   | Natural voice synthesis using the "Orus" deep sci-fi voice profile                           |
-| Expressive movement          | Nova wanders organically around your screen during conversation                              |
-| Draggable overlay            | Click-drag to reposition Nova anywhere on screen                                             |
-| Double-click chat            | Opens a text chat window (fallback to typed input)                                           |
-| Cross-platform               | macOS, Windows, Linux (X11)                                                                  |
-
----
-
-## System Requirements
-
-- **Node.js** v18 or higher
-- **npm** (bundled with Node.js)
-- **Google Gemini API key** — with access to `gemini-3.1-flash-live-preview` (Gemini Live) and `gemini-2.5-flash`
-- **Google Cloud OAuth credentials** _(optional — required for Gmail + Calendar only)_
-
-**Linux only (for desktop automation):**
-
-- `xdotool` or `wmctrl` — window focus / input automation
-- `pactl` — volume control (PulseAudio/PipeWire)
-- `playerctl` — media key control
-- X11 display server (Wayland is not supported — app forces X11 via `ELECTRON_OZONE_PLATFORM_HINT=x11`)
-
-**For Code Agent (live preview):**
-
-- `code` CLI in PATH — VS Code must be installed and the `code` shell command available
-- `vite` — auto-installed in generated React projects via `npx`
-
-**For Video Editor (OpenShot integration):**
-
-- [OpenShot Video Editor](https://www.openshot.org/) — installed as a system app or Flatpak (`org.openshot.OpenShot`)
-- `ffprobe` (part of FFmpeg) — used to extract video metadata before import; install via `brew install ffmpeg` (macOS), `sudo apt install ffmpeg` (Linux), or download from [ffmpeg.org](https://ffmpeg.org) (Windows)
-- Linux only: `xdotool` — required for keystroke delivery (`sudo apt install xdotool` / `sudo pacman -S xdotool`)
-
-**For AI Video Generation (Veo 2.0):**
-
-- A Gemini API key with access to `veo-2.0-generate-001` (Veo 2 access may require allowlisting — check [Google AI Studio](https://aistudio.google.com/))
-
----
-
-## Installation & Setup
-
-### 1. Clone the repository
+## How to Run
 
 ```bash
-git clone <your_repository_url>
-cd NovaAI/robot-widget
-```
-
-### 2. Install dependencies
-
-```bash
+cd robot-widget
 npm install
+npm run start
 ```
 
-### 3. Create your `.env` file inside `robot-widget/`
+**Linux:** The start script forces X11: `--ozone-platform=x11`. Required for `alwaysOnTop`, transparency, and `xdotool` automation.
 
-```env
-# Required — Gemini AI
-GEMINI_API_KEY=your_google_gemini_api_key_here
-
-# Required for Gmail + Calendar features
-GOOGLE_CLIENT_ID=your_google_oauth_client_id
-GOOGLE_CLIENT_SECRET=your_google_oauth_client_secret
-GOOGLE_REDIRECT_URI=http://localhost:3141/oauth2callback
-```
-
-**How to get a Gemini API key:**  
-Visit [Google AI Studio](https://aistudio.google.com/) and create an API key with access to Gemini Live (`gemini-3.1-flash-live-preview`) and `gemini-2.5-flash`.
-
----
-
-## Google Services Setup (Gmail + Calendar)
-
-Gmail and Calendar require a one-time OAuth2 authorization. This is **optional** — Nova works without it, but voice email and calendar commands will return an auth prompt instead.
-
-### Step 1 — Create Google Cloud OAuth credentials
-
-1. Go to [Google Cloud Console](https://console.cloud.google.com/)
-2. Create or select a project
-3. **APIs & Services → Library** → enable **Gmail API** and **Google Calendar API**
-4. **APIs & Services → Credentials → Create Credentials → OAuth 2.0 Client ID**
-5. Choose **Desktop app** as the application type
-6. Copy the **Client ID** and **Client Secret** into your `.env` file
-7. Add `http://localhost:3141/oauth2callback` as an authorized redirect URI
-8. If your OAuth consent screen is in "Testing" mode, add your Google account as a test user
-
-### Step 2 — Run the authorization wizard
+### Google Auth Setup (Email + Calendar + Contacts)
 
 ```bash
 npm run setup-google
 ```
 
-This opens a browser window to authorize Nova. After approval, a token is saved to `credentials/google_token.json`. **Restart Nova after this step.**
+Runs `scripts/setup_google_auth.js`, opens OAuth browser flow, saves token to `credentials/google_token.json`. Required for: email, calendar, contacts.
 
-> The token is saved locally and never leaves your machine. Nova checks `isAuthenticated()` before any API call — if no token exists, it returns a helpful spoken message instead of crashing.
-
----
-
-## Running Nova
+### OpenShot (Video Editor) — Linux
 
 ```bash
-cd robot-widget
-npm start
+# Flatpak (recommended):
+flatpak install flathub org.openshot.OpenShot
+
+# Native package managers:
+sudo pacman -S openshot      # Arch
+sudo apt install openshot-qt  # Debian/Ubuntu
 ```
 
-Nova appears as a small animated orb in the bottom-right corner of your screen. It stays on top of all other windows and is transparent between interactions.
+The video editor also needs libopenshot Python bindings accessible for `clip_gen.py`:
 
----
+```bash
+# Test it:
+flatpak run --command=python3 org.openshot.OpenShot -c "import openshot; print('OK')"
+```
 
-## First Launch
+### xdotool (Linux only, for OpenShot window control)
 
-Chromium enforces a WebAudio autoplay policy. On first launch:
+```bash
+sudo pacman -S xdotool   # Arch
+sudo apt install xdotool  # Debian/Ubuntu
+```
 
-1. Watch the top-left status log — it will show `⚠️ Click the orb once to activate Voice AI`.
-2. **Click the orb once** to unlock microphone access.
-3. You will see the orb transition from its dim offline state to the active idle animation.
-4. Say **"Hey Nova"** followed by your command.
+### ffmpeg (Video Preview rendering)
 
----
-
-## Example Voice Commands
-
-**Browser & Web**
-
-- _"Hey Nova, open YouTube and search for lo-fi music"_
-- _"Nova, go to GitHub.com"_
-- _"Hey Nova, scroll down"_
-- _"Nova, close the browser"_
-- _"Hey Nova, switch to incognito mode"_
-
-**Shopping (Store Assistant Mode)**
-
-- _"Hey Nova, open apple.com"_ → Nova enters store mode and guides you
-- _"Nova, show me the iPhone 16 Pro"_
-- _"Hey Nova, add to cart"_
-
-**Apps & System**
-
-- _"Hey Nova, open Spotify"_
-- _"Nova, turn up the volume"_
-- _"Hey Nova, take a screenshot and tell me what you see"_
-- _"Nova, close VS Code"_
-- _"Hey Nova, run ls -la in terminal"_
-
-**Gmail**
-
-- _"Hey Nova, send an email to Bryan and tell him the meeting is at 3pm"_
-- _"Nova, email John about the project update"_
-
-**Google Calendar**
-
-- _"Hey Nova, what's on my calendar today?"_
-- _"Nova, schedule a dentist appointment for Thursday at 10am"_
-- _"Hey Nova, cancel my 2pm meeting tomorrow"_
-- _"Nova, am I free Friday afternoon?"_
-- _"Hey Nova, show me my calendar"_
-
-**Code Agent**
-
-- _"Hey Nova, build me a React to-do app"_
-- _"Nova, create a Python script that reads CSV files"_
-- _"Hey Nova, add dark mode to my project"_
-- _"Nova, open my portfolio project"_
-- _"Hey Nova, I'm done coding"_
-
-**Stocks & Finance**
-
-- _"Hey Nova, show me Apple's stock chart"_
-- _"Nova, what's Tesla's stock doing?"_
-- _"Hey Nova, when will Nintendo Switch prices drop?"_
-
-**Research**
-
-- _"Hey Nova, write a research paper on quantum computing"_
-- _"Nova, generate an academic paper about climate change"_
-
-**Video Editor (OpenShot)**
-
-- _"Hey Nova, help me edit a video"_ → Nova creates a new project and opens OpenShot
-- _"Nova, open my project called Summer Trip"_
-- _"Hey Nova, what projects do I have?"_
-- _"Nova, import vacation.mp4"_
-- _"Hey Nova, add vacation.mp4 to the timeline"_
-- _"Nova, play the preview"_
-- _"Hey Nova, stop"_
-- _"Nova, undo that"_
-- _"Hey Nova, save the project"_
-- _"Nova, export the video"_
-- _"Hey Nova, close the video editor"_
-
-**AI Video Generation (Veo 2.0)**
-
-- _"Hey Nova, generate a cinematic video of a sunset over the ocean"_
-- _"Nova, create a sci-fi clip of a space station orbiting Earth"_
-- _"Hey Nova, make an animated video of a fox running through a forest"_
-- _"Nova, generate a documentary-style video about coral reefs with a nature aesthetic"_
-- _"Hey Nova, create a commercial video showing people enjoying coffee in a café"_
-- _"Nova, show me my saved video prompts"_
-- _"Hey Nova, regenerate the last video but make it portrait format"_
-
-**Conversation**
-
-- _"Hey Nova, what's the weather like today?"_
-- _"Nova, explain how transformers work in machine learning"_
-
----
-
-## Tech Stack
-
-| Layer                    | Technology                                                                  |
-| ------------------------ | --------------------------------------------------------------------------- |
-| Desktop app shell        | Electron v41                                                                |
-| Widget UI                | CSS animations (orb states: offline, idle, listening, thinking, speaking)   |
-| Offline STT / wake word  | Vosk (`vosk-browser` — English + Spanish models)                            |
-| AI voice conversation    | Google Gemini Live (`@google/genai` — `gemini-3.1-flash-live-preview`)      |
-| AI text + tools          | Google Gemini Flash (`gemini-2.5-flash`)                                    |
-| Research paper AI        | Google Gemini Pro (`gemini-2.5-pro` → fallback `gemini-2.5-flash`)          |
-| Text-to-speech           | Google Gemini TTS (`gemini-2.5-flash-preview-tts`, "Orus" voice)            |
-| AI video generation      | Google Veo 2.0 (`veo-2.0-generate-001` via `predictLongRunning`)            |
-| Video editor integration | OpenShot Video Editor (`.osp` JSON + `ffprobe` + cross-platform keystrokes) |
-| Gmail integration        | Google APIs (`googleapis` — Gmail v1)                                       |
-| Calendar integration     | Google APIs (`googleapis` — Calendar v3)                                    |
-| Google OAuth             | `google.auth.OAuth2` + token persistence                                    |
-| Desktop automation       | OS-native (osascript / PowerShell / xdotool / wmctrl / pactl / playerctl)   |
-| Stock data               | Yahoo Finance REST API (no auth required)                                   |
-| Code generation          | Gemini 2.5 Flash — full project scaffolding in one prompt                   |
-| Live code preview        | Built-in Node.js `http.Server` (static) / Vite (React) / Express (API)      |
-
----
-
-## Rebuilding from Scratch (Claude Reference)
-
-This section is an exact implementation blueprint. Follow the phases in order — each phase depends on the previous one being complete and working.
-
-### Environment Variables
-
-```env
-GEMINI_API_KEY            # Google Gemini API key (required for everything)
-GOOGLE_CLIENT_ID          # OAuth2 Client ID (required for Gmail + Calendar)
-GOOGLE_CLIENT_SECRET      # OAuth2 Client Secret (required for Gmail + Calendar)
-GOOGLE_REDIRECT_URI       # http://localhost:3141/oauth2callback (hardcoded port)
+```bash
+sudo pacman -S ffmpeg      # Arch
+sudo apt install ffmpeg     # Debian/Ubuntu
+brew install ffmpeg         # macOS
+# Windows: download from https://ffmpeg.org/download.html and add to PATH
 ```
 
 ---
 
-### Phase 1 — Electron Shell
+## Environment & Dependencies
 
-**`package.json`**
+### `.env` file (in `robot-widget/`)
 
-```json
+```
+GEMINI_API_KEY=your_gemini_key
+GOOGLE_CLIENT_ID=your_google_client_id
+GOOGLE_CLIENT_SECRET=your_google_client_secret
+```
+
+All three required. `GEMINI_API_KEY` covers Gemini Live API, Imagen (image gen), and Veo (video gen). Google credentials are for Gmail/Calendar/Contacts OAuth.
+
+### npm packages
+
+| Package             | Use                          |
+| ------------------- | ---------------------------- |
+| `@google/genai`     | Gemini Live API, Imagen, Veo |
+| `googleapis`        | Gmail, Calendar, Contacts    |
+| `dotenv`            | env file loading             |
+| `three`             | Three.js 3D orb              |
+| `vosk-browser`      | Offline English WASM STT     |
+| `electron` (devDep) | Desktop shell                |
+
+### Vosk models (bundled)
+
+- `vosk-model/` — English model (~40MB)
+- `vosk-model-es/vosk-model-small-es-0.42/` — Spanish small model (future use)
+
+---
+
+## File Map
+
+| File                           | Role                                                                                                                                                     |
+| ------------------------------ | -------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `main.js`                      | Electron main process. Creates `BrowserWindow`, owns all IPC, drives motion engine, initializes tool handlers.                                           |
+| `renderer.js`                  | Electron renderer. Three.js orb, Vosk STT, mic capture at 16kHz, Gemini audio playback, echo-tail gating, status badge, editor beep system.              |
+| `live.js`                      | **The brain.** Connects to Gemini Live API, defines all 20+ tools in the system prompt, routes tool calls to handlers, manages all live-layer debounces. |
+| `video_editor.js`              | All OpenShot video editor logic: create/read/write `.osp` files directly, add/delete clips, `play_preview` via ffmpeg, save/export. Tool-level debounce. |
+| `clip_gen.py`                  | Python script called via `flatpak run`. Uses libopenshot Python bindings to generate 100%-compatible clip JSON entries.                                  |
+| `gmail.js`                     | Gmail send/draft, Google Contacts resolution, attachment handling.                                                                                       |
+| `calendar.js`                  | Google Calendar: get events, create event, delete event, check availability.                                                                             |
+| `code_agent.js`                | AI coding agent: generates full projects, modifies code, opens browser preview. Uses Gemini text API.                                                    |
+| `image_gen.js`                 | Imagen 3 integration. Single images and batch (multiple subjects). Saves to `~/Desktop`.                                                                 |
+| `video_gen.js`                 | Veo 2 integration. 8-second AI cinematic video with speech/audio. Saves to `~/Videos`.                                                                   |
+| `notes.js`                     | AI notes system: create (full AI content), update, search, list, open. Stored as `.md` files in `~/Documents/Nova Notes/`.                               |
+| `gemini.js`                    | Research paper generation via Gemini text API. Full APA-format academic papers.                                                                          |
+| `tts.js`                       | Text-to-speech via Gemini TTS API. Outputs WAV played by renderer. (Used for intro message, not main conversation.)                                      |
+| `stt.js`                       | Whisper STT fallback (not used in Live mode).                                                                                                            |
+| `google_auth.js`               | OAuth2 token management for Google APIs.                                                                                                                 |
+| `index.html`                   | Minimal HTML shell. Loads Three.js orb and renderer.js.                                                                                                  |
+| `chat.html` / `chat.js`        | Floating text chat panel (opened by double-clicking orb).                                                                                                |
+| `attachments_panel.html`       | File picker panel for email attachments.                                                                                                                 |
+| `contacts_panel.html`          | Contacts list panel for email mode.                                                                                                                      |
+| `calendar_panel.html`          | Calendar events panel.                                                                                                                                   |
+| `video_editor_panel.html`      | Video editor status panel.                                                                                                                               |
+| `notes_panel.html`             | Notes viewer panel.                                                                                                                                      |
+| `scripts/setup_google_auth.js` | OAuth setup script.                                                                                                                                      |
+
+---
+
+## Core Pipeline: Voice → Gemini → Action
+
+### 1. Mic Capture (renderer.js)
+
+Mic captured at **16kHz mono PCM** via Web Audio API with a **2.5× gain boost** (for distant voice / quiet mics). Audio flows through a `ScriptProcessorNode` (4096 samples/chunk) into two paths:
+
+- **Vosk path:** WASM recognizer → live transcript shown in UI
+- **Gemini Live path:** raw PCM chunks → IPC to main process → Gemini websocket
+
+**Echo-tail gate (`ECHO_TAIL_MS = 2500ms`):** When Gemini's TTS finishes playing, the mic is blocked for 2500ms. This prevents Nova from hearing its own voice and re-triggering tool calls. `_speakingEndedAt` is set when TTS ends; audio chunks are dropped while `Date.now() - _speakingEndedAt < ECHO_TAIL_MS`.
+
+### 2. Gemini Live Connection (live.js)
+
+**Model:** `gemini-3.1-flash-live-preview`
+
+Session config:
+
+```javascript
 {
-  "name": "robot-widget",
-  "main": "main.js",
-  "scripts": {
-    "start": "electron . --no-sandbox --disable-gpu-sandbox --enable-transparent-visuals --enable-logging --ozone-platform=x11",
-    "setup-google": "node scripts/setup_google_auth.js"
-  },
-  "dependencies": {
-    "@google/genai": "^1.48.0",
-    "dotenv": "^17.3.1",
-    "googleapis": "^144.0.0",
-    "vosk-browser": "^0.0.8"
-  },
-  "devDependencies": { "electron": "^41.2.0" }
+    responseModalities: [Modality.AUDIO],  // Nova speaks, never types
+    systemInstruction: "..."               // Full tool definitions + personality
 }
 ```
 
-**`main.js` — window creation**
+Audio chunks flow: `sendAudioChunk(base64Data)` → `activeSession.sendRealtimeInput({ media: { data, mimeType: 'audio/pcm;rate=16000' } })`
 
-- Force X11 on Linux: `process.env.ELECTRON_OZONE_PLATFORM_HINT = 'x11'` before `app.ready`.
-- `app.commandLine.appendSwitch('autoplay-policy', 'no-user-gesture-required')` — disables Chromium autoplay block (needed for TTS).
-- Register `appassets://` protocol as privileged + `supportFetchAPI`.
-- Create main `BrowserWindow`: 130×130, `transparent: true`, `frame: false`, `alwaysOnTop: true`, `skipTaskbar: true`, `type: 'toolbar'` on Linux. `webPreferences: { nodeIntegration: true, contextIsolation: false, webSecurity: false }`.
-- `mainWindow.setAlwaysOnTop(true, 'screen-saver')` after creation.
-- `ipcMain.on('drag-start/move/end')` — stores `dragOffset`, calls `win.setBounds()`.
+### 3. Tool Call Processing
 
-**`index.html`**
+When Gemini fires a `toolCall` event on the session:
 
-- Pure CSS animated orb. No framework. `background: transparent`, `overflow: hidden`.
-- `#widget` element: 120×120 px with `.offline`, `.listening`, `.speaking`, `.thinking` CSS classes.
-- Visual layers inside the orb: `#arc` (spinning conic-gradient ring), `#arc2` (ghost counter-arc), `#ring` (crisp static border), `#core` (inner glow sphere), `#dot` (center pulsing dot).
-- Load `vosk-browser/dist/vosk.js` as a normal `<script>` tag first, then load `renderer.js` as `type="module"`.
+```
+toolCall received
+    ↓
+[live.js] checks debounce (per-action or per-filename key)
+    ↓ (passes)
+Sends IMMEDIATE ACK (functionResponse) with speaking instructions
+    ↓
+Runs async tool handler in background
+    ↓
+On completion: sends text injection (sendRealtimeInput({ text: ... })) with next-step guidance
+    ↓ (1500ms delay for file operations, 200ms for others)
+```
 
-**`renderer.js` — orb state machine**
+### 4. THE IMMEDIATE ACK PATTERN — Most Critical Invariant
 
-- `window.novaState` object: `{ isAwake, isInConversation, isSpeaking, isProcessingCommand, isResearching, ... }`.
-- `setInterval(() => setOrbState(...), 100)` — polls `novaState` and updates `#widget` CSS class.
-- Drag: `mousedown/mousemove/mouseup` → IPC `drag-start/move/end`.
-- `dblclick` → IPC `open-chat`.
+**Gemini Live API only reliably generates TTS when it receives a `functionResponse` while the user's audio turn is still "hot."** Delayed responses (sent seconds later) often produce no audio at all.
 
----
+**The correct pattern (used everywhere):**
 
-### Phase 2 — Voice Pipeline
+```javascript
+// Step 1: Send ACK immediately — this triggers Gemini TTS
+activeSession.sendRealtimeInput({
+  functionResponses: [
+    {
+      id: call.id,
+      response: {
+        status: "ok",
+        message:
+          'Say out loud: "Adding League1.mp4, one moment!" Then wait. Do NOT call any tool.',
+      },
+    },
+  ],
+});
 
-**`stt.js`** — `transcribeAudio(buffer)`
+// Step 2: Run actual tool async in background
+automationRef.videoEditorTool(call.args).then((result) => {
+  // Step 3: After tool finishes, inject context via text (not function response)
+  setTimeout(() => {
+    activeSession.sendRealtimeInput({
+      text: `[CLIP_ADDED] File added. Say: "Done! ..."`,
+    });
+  }, 1500); // delay lets ACK TTS finish first
+});
+```
 
-- Accepts a raw WebM/Ogg `Buffer` from `MediaRecorder`.
-- Sends base64 to `gemini-2.5-flash` with `mimeType: 'audio/webm'` and a transcription instruction.
-- Returns plain text string.
+**Never** delay the function response to wait for the tool result. The ACK always goes first.
 
-**`tts.js`** — `generateSpeech(text, relativeOutputPath)`
+### 5. Text Injections for Post-Tool Guidance
 
-- Calls `gemini-2.5-flash-preview-tts` with `responseModalities: ['AUDIO']`, voice name `'Orus'`.
-- Response is raw 16-bit little-endian PCM at 24 kHz, mono. **There is NO WAV header in the response.**
-- Build a 44-byte RIFF/WAV header manually (`pcmToWav()`) and prepend it. Write to disk.
-- Returns the relative output path.
+After a tool completes, context is delivered via `sendRealtimeInput({ text: "..." })`. These are injected as user-side context updates (not function responses).
 
-**`gemini.js`** — `askGemini(text)`
+**Injection delays:**
 
-- Stateful chat with `history = []` array of `{ role, parts }` turns.
-- Rolling window: if `history.length > 38`, slice to last 38.
-- Returns `response.text`.
-
-**`renderer.js` — Vosk wake word loop**
-
-- Load Vosk model: `const model = await Vosk.createModel('./vosk-model/')`.
-- Create recognizer: `recognizer = new model.KaldiRecognizer(16000)`.
-- `AudioContext` at 16000 Hz, `ScriptProcessorNode` 4096 samples → on each `onaudioprocess`, convert Float32 to Int16 PCM → `recognizer.acceptWaveform(data)`.
-- On `recognizer.result()`: if final transcript contains "nova" or "hey nova" → call `wakeUp()`.
-- `wakeUp()`: set `novaState.isAwake = true`, send `live-start` IPC, start forwarding PCM chunks over `live-audio-chunk` IPC.
-- On 3+ seconds of silence after wake: send `live-end` IPC, reset state.
-
----
-
-### Phase 3 — Gemini Live + Tool Calls
-
-**`live.js`** — `startLiveSession(mainWindow, automation)`
-
-- `const model = 'gemini-3.1-flash-live-preview'`
-- `ai.live.connect({ model, config: { responseModalities: [Modality.AUDIO], systemInstruction: '...', tools: [...] } })`
-- System prompt covers: Nova's personality, strict tool trigger rules for all 8 tools, Store Assistant Mode protocol, shopping flow steps, language rules.
-- **8 tools declared:** `get_browser_state`, `control_browser`, `execute_system_command`, `create_research_paper`, `show_stock_chart`, `send_email`, `calendar_action`, `code_agent`.
-- On `session.on('toolCall')`: check debounce maps → dispatch to handler → call `session.sendToolResponse({ functionResponses })`.
-- On `session.on('serverContent')`: collect audio parts → base64 → `mainWindow.webContents.send('live-audio-response', base64)`.
-- Export: `startLiveSession`, `sendAudioChunk`, `sendTextChunk`, `endLiveSession`, `setBrowserOpen`, `setStoreAssistantActive`.
-
-**`main.js` — Live IPC handlers**
-
-- `ipcMain.on('live-start')` → creates `Automation` class instance → calls `startLiveSession(mainWindow, automation)`.
-- `ipcMain.on('live-audio-chunk', (event, base64))` → calls `sendAudioChunk(base64)`.
-- `ipcMain.on('live-end')` → calls `endLiveSession()`.
-- `ipcMain.handle('generate-speech', async (event, text))` → calls `tts.js` → returns WAV path.
-- `ipcMain.handle('ask-grok', async (event, text))` → calls `gemini.js` → returns text reply.
+- File operations (`import_file`, `add_to_timeline`, `delete_clip`): **1500ms** — lets ACK TTS finish
+- Other operations: **200ms**
+- If injection arrives during TTS playback → TTS gets interrupted → Gemini may go silent
 
 ---
 
-### Phase 4 — Desktop Automation
+## Gemini Live API — Critical Invariants
 
-**`main.js` — Automation class**
+Hard-won lessons from debugging. Violating any of these breaks audio or causes loops.
 
-- `execute_system_command` handler: large `if/else` or alias map. Platform-switch for `open`, `close`, `volume`, `media`.
-  - Linux open app: `exec('xdg-open ...')` or `spawn('name')`.
-  - Linux close: `exec("xdotool search --name 'Window Title' windowclose")`.
-  - Volume: `exec('pactl set-sink-volume @DEFAULT_SINK@ 80%')`.
-  - Media: `exec('playerctl play-pause')`.
-- `capture-screen` IPC: `desktopCapturer.getSources({ types: ['screen'] })` → PNG base64 → Gemini for description.
+### 1. Only functionResponses trigger audio reliably
 
-**`browser.html`** — Nova Browser Agent window
+Text injections (`sendRealtimeInput({ text: ... })`) update context but do NOT reliably trigger TTS. Only `functionResponses` reliably trigger audio generation. This is why every tool uses immediate ACK with speaking instructions.
 
-- Full-screen `BrowserWindow` with `<webview>` element.
-- On `new-url` IPC: `webview.loadURL(url)`.
-- On `inject-script` IPC: `webview.executeJavaScript(script)` for scroll and DOM map extraction.
-- DOM map extraction: walks `document.querySelectorAll('a,button,input,select,h1,h2,h3,label')`, collects `{ tag, text, id, href }`, sends back over IPC as `dom-map-results`.
-- `webview.addEventListener('did-navigate')` → sends `url-changed` IPC → main.js checks store patterns.
+### 2. Never mention the just-processed filename in post-success injections
 
-**Store detection in `main.js`**
+After importing `League1.mp4`, if CLIP_ADDED says "Do NOT add League1.mp4 again", Gemini reads "League1.mp4" and may call import_file for it again. Only mention the NEXT file(s), never the file just processed.
 
-- Array of `{ re, name }` patterns covering 20+ retailers.
-- On `url-changed`: if URL matches any pattern → set `_storeAssistantActive = true` → inject `[STORE DETECTED]` text into live session → call `runStoreAutoScan()`.
-- `runStoreAutoScan()`: reads DOM map → extracts headings and price signals (up to 20 elements) → injects a narration prompt telling Gemini to describe products out loud.
-- Stuck-navigation detection: if `smart_click` leaves URL unchanged twice in a row → inject a `[NAVIGATION STUCK]` message with direct URL patterns for common stores.
+### 3. Debounce responses must always include a speak instruction
 
----
+If a debounce response returns `"already_running"` with no `Say:` instruction, Gemini goes silent. Every debounce response must tell Gemini what to say:
 
-### Phase 5 — Google Services
+```javascript
+// Bad:
+message: "already_running";
 
-**`google_auth.js`**
+// Good:
+message: 'Say: "Let me add League2.mp4 for you!" Then call import_file(file_name="League2.mp4") immediately.';
+```
 
-- `createOAuth2Client()`: reads `GOOGLE_CLIENT_ID` and `GOOGLE_CLIENT_SECRET` from env. Redirect URI hardcoded as `http://localhost:3141/oauth2callback`.
-- `loadToken()` / `saveToken()`: reads/writes `credentials/google_token.json`.
-- `isAuthenticated()`: returns `true` if token file exists.
-- `getAuthClient()`: loads token → sets credentials → checks expiry → refreshes if needed → on no token, opens browser OAuth flow via `waitForOAuthCode()` (spins up a temporary HTTP server on port 3141).
-- `initialize(shellOpenFn)`: must be called from `main.js` with `shell.openExternal` before any OAuth flow.
+### 4. Per-filename debounce, never per-action, for file operations
 
-**`scripts/setup_google_auth.js`**
+`import_file:league1` and `import_file:league2` are independent keys. Using just `import_file` blocks different files from being imported within the window.
 
-- Standalone Node script (not Electron). Calls `googleAuth.initialize(openUrl)` then `getAuthClient()` to trigger the full OAuth browser flow and save the token. Run once before first use.
+### 5. Concurrent tool calls with different files must both run
 
-**`gmail.js`**
+When Gemini calls `add_to_timeline("League1")` and `add_to_timeline("League2")` simultaneously, both should execute. Both layers (live.js + video_editor.js) use per-filename keys to allow this.
 
-- `searchContacts(name)`: runs 3 Gmail search queries (`to:"name" in:sent`, `from:"name"`, `"name" in:sent`), parses `To/From/Cc` headers, scores by frequency, returns best match `{ email, displayName }`.
-- `sendEmail({ to, subject, body })`: base64url-encodes a raw RFC 2822 MIME message, calls `gmail.users.messages.send`. If `draft_only` is true, calls `gmail.users.drafts.create` instead.
-- `handleSendEmailTool(args)`: top-level called from `live.js`. Calls `searchContacts` to resolve `recipient_name`, uses Gemini to expand `message_intent` into a full email body, then calls `sendEmail`.
+### 6. Text injection timing relative to TTS is critical
 
-**`calendar.js`**
+Injection during TTS → TTS interrupted → silence. For file operations: 1500ms delay. For others: 200ms.
 
-- `parseNaturalTime(utterance)`: asks `gemini-2.5-flash` to convert natural language to `{ start, end }` ISO 8601 JSON. Detects user timezone with `Intl.DateTimeFormat().resolvedOptions().timeZone`.
-- `getEventsInRange(start, end)`: calls `calendar.events.list`, returns formatted event strings.
-- `createEvent({ title, start, end, attendees })`: calls `calendar.events.insert` with conflict check.
-- `deleteEvent({ title, timeExpression })`: `parseNaturalTime` → lists events in range → fuzzy-matches title → calls `calendar.events.delete`.
-- `findFreeSlots(timeExpression)`: scans 8am–8pm in 30-min intervals for gaps.
-- `handleCalendarActionTool(args)`: dispatches by `args.action` to the above functions.
+### 7. ACK messages must NOT pre-confirm tool results
 
-**`calendar_panel.html`** — Floating calendar UI
-
-- Standalone `BrowserWindow` (400×500). `nodeIntegration: true`, `contextIsolation: false`.
-- Pure CSS glassmorphism panel with `background: rgba(8,12,22,0.93)`, `border: 1px solid rgba(0,255,200,0.22)`.
-- On load: `ipcRenderer.invoke('calendar-get-events')` → renders today's events as a list.
-- In `main.js`: `ipcMain.handle('calendar-get-events')` calls `calendar.getEventsInRange(today, endOfDay)`.
-- `ipcMain.on('open-calendar-panel')`: creates `calendarWin` if not already open.
+Wrong: `"Say: 'Done! League1 removed from timeline.'"` (before tool confirms it worked)
+Right: `"Say: 'Removing League1 from the timeline, one moment!' Then wait."` (neutral, waits for actual result)
+If the tool fails after a pre-confirmation ACK, Gemini gets contradicting signals → silence.
 
 ---
 
-### Phase 6 — Stock Charts
+## Feature: Video Editor
 
-**`stock.html`** — Floating chart window
+### Overview
 
-- Standalone 340×340 `BrowserWindow`: `transparent: true`, `frame: false`, `alwaysOnTop: true`, top-left position.
-- Canvas-based price chart drawn via `CanvasRenderingContext2D`. Plots 3-month daily close prices.
-- Receives data via `ipcRenderer.on('stock-data', (event, stockInfo))`. `stockInfo` shape: `{ company, symbol, exchange, currency, price, change, changePct, high52, low52, volume, prices[], firstDate, outlook }`.
+Voice-controlled OpenShot video editor. Nova creates/opens `.osp` project files directly (bypasses OpenShot GUI), manipulates them programmatically, relaunches OpenShot to display changes.
 
-**`main.js` — stock handler**
+### Key Files
 
-- `showStockChartInternal(company, symbol)`:
-  1. If no symbol: `GET https://query1.finance.yahoo.com/v1/finance/search?q=<company>` → extract first quote symbol.
-  2. `GET https://query1.finance.yahoo.com/v8/finance/chart/<symbol>?interval=1d&range=3mo` → extract `meta` + `indicators.quote[0].close` prices.
-  3. `_snapToTopRight()` — moves Nova to top-right corner.
-  4. `createStockWindow()` → `stockWin.webContents.send('stock-data', stockInfo)`.
-- `_restoreFromStockMode()`: called when stock window closes → resumes wander if was in conversation, else snaps home.
+- `video_editor.js` — All logic
+- `clip_gen.py` — libopenshot clip JSON generator (Python, called via flatpak)
 
----
+### Architecture: Direct `.osp` File Editing
 
-### Phase 7 — Code Agent
+Nova does NOT use the OpenShot GUI to add clips. Instead:
 
-**`code_agent.js`** — exported functions
+1. Kill OpenShot (if running)
+2. Read `.osp` JSON file directly
+3. Add/modify JSON (file entries + clip entries)
+4. Write `.osp` back to disk
+5. Relaunch OpenShot in background (non-blocking via `spawn + detached + unref`)
 
-- `listDesktopProjects()`: `fs.readdirSync(desktopPath, { withFileTypes: true })` → filter directories → return names array.
-- `fuzzyMatchProject(query, projects)`: scores each project name (exact=100, prefix=82, contains=64, character overlap ≤45). Returns match only if score ≥ 50.
-- `createProjectFolder(projectName)`: sanitizes name → `fs.mkdirSync(path, { recursive: true })` → stores in `_projectPath`.
-- `openInVSCode(folderPath)`: `spawn('code', ['--new-window', folderPath], { detached: true })`. Falls back to `xdg-open` on Linux failure.
-- `waitForPort(port, timeoutMs)`: polls via `net.Socket` every 400 ms until port accepts connections.
-- `readProjectFiles(projectPath)`: recursive walk, skips `node_modules/dist/.git/__pycache__/.venv`, reads only known code extensions, skips files > 80 KB.
-- `buildGenerationPrompt(name, type, description)`: returns a detailed prompt instructing Gemini to return a JSON object `{ "filename": "file content as string" }` for all project files. Includes exact dependency versions and file structure per `type`.
-- `generateProject(args)`: `buildGenerationPrompt` → `gemini-2.5-flash` → `parseJsonResponse` (strips markdown fences) → write all files → `npm install` (if needed) → `openInVSCode` → start dev server → `waitForPort` → return `{ success, projectPath, port, url }`.
-- `modifyProject(args)`: `readProjectFiles` → build modification prompt with all existing file contents → Gemini returns only changed files as JSON → write only changed files.
-- `startDevServer(projectPath, type)`: spawns the appropriate command per project type. Stores process in `_serverProc` / `_apiProc`.
-- `stopSession()`: kills `_serverProc`, `_apiProc`, `_staticServer`, closes VS Code window.
+This makes operations take ~0.5s instead of several seconds via GUI automation.
 
-**`main.js` — codeAgentTool dispatcher**
-
-- `automation.codeAgentTool(args)` is the entry point called from `live.js`.
-- Dispatches `args.action` to the appropriate `code_agent.js` function.
-- `coding-done` IPC: when `generate_code` or `open_project` completes, sends `{ success, url, isExisting }` to renderer. Renderer then injects a summary text into the Gemini Live session.
-
----
-
-### Phase 8 — Expressive Movement Engine
-
-All in `main.js`. Nova moves organically while in conversation, character driven by emotional state.
-
-**State machine:**
-
-- `_motionMode`: `'listening'` | `'speaking'` | `'thinking'`
-- `ipcMain.on('nova-move-state', mode)` — renderer sends this on every state change
-- `ipcMain.on('nova-bounce-start')` / `nova-bounce-stop` — turns wander on/off
-
-**Wander loop** (`_startWanderInterval`, 30 ms tick):
-
-- Per-mode parameters: `speed` (lerp factor) and `changeMs` (target change interval).
-  - Speaking: slowest (0.012, 5000 ms) — Nova barely moves while talking.
-  - Listening: gentle (0.018, 3500 ms).
-  - Thinking: slightly restless (0.022, 2200 ms).
-- `_pickWanderTarget()` picks a random position in the upper-center area (range shrinks in speaking mode).
-- Lerps `_bouncePos` toward target, clamps to screen, calls `mainWindow.setBounds()`.
-
-**Snap home** (`_snapHome`, ~60 fps): ease-out cubic lerp back to bottom-right corner.
-**Stock mode** (`_snapToTopRight`): moves Nova to top-right when stock chart is open; restores on close.
-
----
-
-### Phase 9 — Video Editor Integration
-
-**`video_editor.js`** — `handleVideoEditorTool(args, logFn)`
-
-The module exposes a single async handler dispatched by `live.js` via the `video_editor` tool. All state is module-level:
-
-- `_videoEditorModeActive` — whether an OpenShot session is currently live
-- `_editorOpening` — hard lock to prevent concurrent launch races
-- `_currentProjectPath` — absolute path to the active `.osp` file
-- `_veDebounce` Map — per-action timestamp debounce (3–15 second windows)
-
-**Project file format (`.osp`):**  
-`createMinimalOspProject(filePath, title)` writes a valid OpenShot JSON project:
+### OpenShot Project File (`.osp`) Format
 
 ```json
 {
-  "id": "<uuid>",
+  "id": "uuid",
   "fps": { "num": 24, "den": 1 },
   "width": 1280,
   "height": 720,
   "sample_rate": 48000,
   "channels": 2,
-  "layers": [{ "id": "L1", "number": 1000000 }, "..."],
-  "clips": [],
-  "files": [],
-  "effects": [],
-  "markers": []
+  "files": [
+    {
+      "id": "uuid",
+      "path": "/absolute/path/to/video.mp4",
+      "name": "video.mp4",
+      "has_audio": true,
+      "has_video": true,
+      "duration": 30.5,
+      "fps": { "num": 30, "den": 1 },
+      "width": 1920,
+      "height": 1080
+    }
+  ],
+  "clips": [
+    {
+      "id": "uuid",
+      "file_id": "matches files[*].id",
+      "layer": 5000000,
+      "position": 0.0,
+      "start": 0.0,
+      "end": 30.5,
+      "has_video": {
+        "Points": [{ "co": { "X": 1, "Y": 1 }, "interpolation": 0 }]
+      },
+      "has_audio": {
+        "Points": [{ "co": { "X": 1, "Y": 1 }, "interpolation": 0 }]
+      }
+    }
+  ],
+  "layers": [
+    { "id": "L5", "number": 5000000, "label": "", "y": 0, "lock": false }
+  ]
 }
 ```
 
-The `version` field is set to `"0.0.0"` placeholders — OpenShot overwrites on save, avoiding version-mismatch warnings.
+**Critical details:**
 
-**`import_file` flow (no GUI required):**
+- Clips always use layer **5000000** (Track 5, top visible track in OpenShot default view)
+- `has_video`/`has_audio` in clips use **keyframe format** (Y=1 = enabled, Y=-1 = disabled)
+- `has_audio` in file entries is stored as **boolean** (`true`/`false`) by Nova, but OpenShot may convert to keyframe format on save
+- Paths in file entries must be **absolute** to survive cross-session use
 
-1. Kill OpenShot → `killOpenShot()` (platform-specific: `osascript quit`, `flatpak kill`, or `taskkill`)
-2. Run `ffprobe` on the video → parse JSON → extract width, height, duration, FPS, codecs
-3. Build a complete `fileEntry` object (UUID, media type, frames count, `reader.path`, etc.)
-4. Read `.osp` → remove any existing entry for that path → push new entry → write back
-5. Relaunch OpenShot with the `.osp` path argument → returns immediately
+### clip_gen.py — Why It Exists
 
-**`add_to_timeline` flow:**
+Manually constructing clip JSON causes version-mismatch warnings and corrupted clips in OpenShot. `clip_gen.py` uses the actual libopenshot Python bindings to generate 100%-compatible JSON, then overrides key fields:
 
-1. Kill OpenShot
-2. Read `.osp` → fuzzy-match file entry by name/path → find `lastEnd` of layer 1000000 clips
-3. Build `clipEntry` with full keyframe structure (`alpha`, `location_x/y`, `rotation`, `scale_x/y`, `volume`, `time` — all as single-point keyframes at `(1, 1)` or `(1, 0)`)
-4. Push clip → write `.osp` → relaunch OpenShot
+```python
+clip = openshot.Clip(video_path)
+clip.Position(position)
+clip.Layer(layer)
+d = json.loads(clip.Json())
+d['id'] = str(uuid.uuid4())
+d['file_id'] = file_id
+d['position'] = position
+d['layer'] = layer
+d['start'] = 0.0
+d['end'] = end_time
+# Override has_video/has_audio to Y=1 (enabled)
+_kf_true = {"Points": [{"co": {"X": 1, "Y": 1}, "handle_left": {"X": 0.5, "Y": 1}, "handle_right": {"X": 0.5, "Y": 0}, "handle_type": 0, "interpolation": 0}]}
+d['has_video'] = _kf_true
+d['has_audio'] = _kf_true
+```
 
-**Keystroke delivery** (`sendKey(key)` / `typeText(text)`):
+The Y=-1 default from libopenshot means "disabled" — overriding to Y=1 is required for clips to render in OpenShot.
 
-- Linux: `xdotool search --onlyvisible --name "OpenShot"` → `xdotool key --window $WID --clearmodifiers <key>`
-- macOS: `osascript -e 'tell application "System Events" to keystroke "<key>" using {<mods>}'`
-- Windows: `WScript.Shell.SendKeys()` via PowerShell, with key format translation (`ctrl→^`, `shift→+`, etc.)
+### Video Editor Actions
 
-`sendKeyToActive()` / `typeTextToActive()` — alternate versions that skip `focusOpenShot()`, targeting the currently focused window (e.g. an open file dialog on Linux).
+| Action            | What Happens                                                                                                                                        |
+| ----------------- | --------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `list_projects`   | Scans `~/Videos/*.osp`, returns project names                                                                                                       |
+| `open_editor`     | Creates or finds `.osp`, kills existing OpenShot, launches OpenShot with project file. Sets `_videoEditorModeActive = true`, `_currentProjectPath`. |
+| `import_file`     | Kills OpenShot, adds file entry + clip to `.osp` via `clip_gen.py`, relaunches OpenShot in background                                               |
+| `add_to_timeline` | Same as import_file but auto-imports the file entry if not yet in `proj.files`                                                                      |
+| `delete_clip`     | Removes clip entries from `.osp` (keeps file entry intact), relaunches OpenShot                                                                     |
+| `play_preview`    | Reads clips from `.osp`, builds ffmpeg filter_complex, renders `{project}_movie.mp4`, opens with system player                                      |
+| `save_project`    | Relaunches OpenShot if killed, waits for window, sends Ctrl+S via xdotool                                                                           |
+| `export_video`    | Focuses OpenShot, sends Ctrl+E to open OpenShot's export dialog                                                                                     |
+| `undo`            | Focuses OpenShot, sends Ctrl+Z                                                                                                                      |
+| `redo`            | Focuses OpenShot, sends Ctrl+Y                                                                                                                      |
+| `close_editor`    | Kills OpenShot, resets state variables, clears debounces                                                                                            |
 
-**`main.js` IPC additions:**
+### State Variables (video_editor.js)
 
-- `ipcMain.handle('video-editor-panel-data')` — responds with `{ projects, videos, currentProject }` for the panel UI
-- On `video_editor` tool call → `handleVideoEditorTool(args, logFn)` → sends `video-editor-panel-status` IPC to update the floating panel
+```javascript
+let _videoEditorModeActive = false; // true after open_editor succeeds
+let _editorOpening = false; // hard lock during open_editor launch sequence
+let _currentProjectPath = null; // absolute path to active .osp
+let _openShotKilled = false; // true when we killed OpenShot to edit .osp
+```
 
-**`video_editor_panel.html`** — standalone `BrowserWindow`:
+### Debounce Architecture (Two Layers)
 
-- `transparent: true`, `frame: false`, `alwaysOnTop: true`
-- `ipcRenderer.on('video-editor-panel-data', (_, data))` → calls `renderList()` for projects and videos
-- `ipcRenderer.on('video-editor-panel-status', (_, status))` → updates action status text
-- Projects in the active session are highlighted with a purple border (`rgba(120,80,255,0.40)`)
+**Layer 1 — live.js (`_videoEditorDebounce` Map, per-filename keys):**
+
+```javascript
+VIDEO_EDITOR_DEBOUNCE_MS = {
+  list_projects: 30000, // user takes time to pick; prevent re-call loop
+  open_editor: 300000, // 5-minute session lock
+  import_file: 30000, // per-filename: import_file:league1
+  add_to_timeline: 15000, // per-filename: add_to_timeline:league2
+  delete_clip: 15000, // per-filename: delete_clip:league1
+  play_preview: 30000, // ffmpeg takes 10-60s
+  save_project: 10000,
+  close_editor: 8000,
+};
+
+// Key format for file operations:
+const veKey =
+  (action === "import_file" || action === "add_to_timeline") && _veFileName
+    ? `${action}:${_veFileName}` // "import_file:league1"
+    : action; // "play_preview"
+```
+
+**Layer 2 — video_editor.js (`_veDebounce` Map, also per-filename):**
+
+```javascript
+VE_DEBOUNCE_MS = {
+  import_file: 12000,
+  add_to_timeline: 3000, // prevents race condition when two files fire simultaneously
+  delete_clip: 3000,
+};
+
+// Same per-filename key format:
+const _deKey =
+  (action === "import_file" ||
+    action === "add_to_timeline" ||
+    action === "delete_clip") &&
+  file_name
+    ? `${action}:${file_name
+        .toLowerCase()
+        .replace(/\.[^.]+$/, "")
+        .trim()}`
+    : action;
+```
+
+**Cross-debounce after import_file** — prevents Gemini calling add_to_timeline for the same file that was just imported via import_file:
+
+```javascript
+if (action === "import_file") {
+  const crossKey = _veFileName
+    ? `add_to_timeline:${_veFileName}`
+    : "add_to_timeline";
+  _videoEditorDebounce.set(
+    crossKey,
+    nowVE + VIDEO_EDITOR_DEBOUNCE_MS.add_to_timeline,
+  );
+}
+```
+
+### play_preview — ffmpeg Rendering
+
+Reads clips from `.osp`, handles both boolean and keyframe `has_audio` formats, resolves relative paths, builds a filter_complex:
+
+```
+// Per clip with audio:
+[i:v]scale=1280:720:force_original_aspect_ratio=decrease,pad=1280:720:(ow-iw)/2:(oh-ih)/2,trim=start=S:end=E,setpts=PTS-STARTPTS[vi]
+[i:a]atrim=start=S:end=E,asetpts=PTS-STARTPTS[ai]
+
+// Per clip without audio (synthesized silence):
+aevalsrc=0:channel_layout=stereo:sample_rate=44100[_silenti]
+[_silenti]atrim=0:DUR,asetpts=PTS-STARTPTS[ai]
+
+// Concat:
+[v0][a0][v1][a1]concat=n=2:v=1:a=1[outv][outa]
+```
+
+Output: `{projectName}_movie.mp4` in same folder as `.osp`. Opened with system player (`xdg-open` Linux, `open` Mac, `start` Windows).
+
+**Fallback:** If no clips on layer 5000000, fall back to all clips in project (handles cases where OpenShot reorganized layers).
+
+**has_audio detection:**
+
+```javascript
+function _hasAudioEnabled(val) {
+  if (typeof val === "boolean") return val;
+  if (val && typeof val === "object" && Array.isArray(val.Points)) {
+    const y = val.Points[0]?.co?.Y;
+    return y === undefined || Number(y) >= 0; // Y=-1 = disabled
+  }
+  return !!val;
+}
+```
+
+**Relative path resolution:**
+
+```javascript
+const fPath =
+  rawPath && !path.isAbsolute(rawPath)
+    ? path.resolve(ospDir, rawPath) // ospDir = dirname(_currentProjectPath)
+    : rawPath;
+```
+
+### ACK Messages for Video Editor Actions
+
+| Action            | ACK Message                                                                                                                           |
+| ----------------- | ------------------------------------------------------------------------------------------------------------------------------------- |
+| `open_editor`     | `"Say: 'Opening project [name], one moment!' Listen — if user says name is wrong, acknowledge it but do NOT call open_editor again."` |
+| `import_file`     | `"Say out loud: 'Adding [file] to your timeline, one moment!' Then wait."`                                                            |
+| `add_to_timeline` | `"Say: 'Adding [file] to the timeline, one moment!' Then wait."`                                                                      |
+| `delete_clip`     | `"Say: 'Removing [file] from the timeline, one moment!' Then wait."`                                                                  |
+| `play_preview`    | `"Say out loud: 'Rendering your movie now — this takes a few seconds!' Do NOT call any tool. Wait for the result."`                   |
+| `save_project`    | `"Say out loud: 'Saving your project! I'll use keyboard shortcuts.' Then wait silently."`                                             |
+
+### Post-Completion Injections
+
+**After `import_file` success (1500ms delay):**
+
+```
+// If 1 file remains:
+[CLIP_ADDED] File added. Say: "Done! Want to add League2.mp4 as well? Say yes."
+If yes: call import_file(file_name='League2.mp4').
+Do NOT call import_file for any previously added file.
+
+// If multiple remain:
+[CLIP_ADDED] File added. Say: "Done! You can add: League2.mp4, League3.mp4. Which one?"
+
+// If none remain:
+[CLIP_ADDED] All files on timeline. Say: "All done! Say play to preview or save."
+```
+
+**After `add_to_timeline` success (1500ms delay):** Same CLIP_ADDED pattern.
+
+**After `delete_clip` success (1500ms delay):**
+
+```
+[CLIP_DELETED] Say: "[tool speak text]" Then guide: "Say a filename to add ([available files]), say play to preview, or say save."
+```
+
+**After `open_editor` success (200ms delay):**
+
+```
+[FILE_IMPORT_MODE] The video editor is open with project "[name]".
+Available video files: League1.mp4, League2.mp4.
+Say to the user: "The editor is open! Which video file would you like to add? Here are your files: ..."
+The INSTANT the user says any filename, call import_file(file_name='[exact filename]') IMMEDIATELY.
+NEVER call open_editor again. You ARE in the editor.
+```
+
+### Debounce Responses for Video Editor
+
+**When same file is called again after already added (1 remaining):**
+
+```
+Say: "Let me add [remaining_file] for you!" Then IMMEDIATELY call import_file(file_name='[remaining_file]') RIGHT NOW.
+```
+
+Note: Never mention the blocked filename. Gemini latches onto any filename it reads.
+
+**When play_preview is debounced (mid-render):**
+
+```
+Say out loud: "Still rendering your video, please wait a moment!" Do NOT call play_preview again.
+```
+
+**When open_editor is debounced (editor already open, user says video filename):**
+
+```
+EDITOR IS ALREADY OPEN. The user wants to ADD "[filename]" to the timeline. Call import_file(file_name='[filename]') RIGHT NOW.
+```
+
+### System Prompt for Video Editor
+
+Defined in live.js as a dynamic function (captures current project list). Key elements:
+
+- Mandatory 4-step workflow in a visual box
+- Project naming guard: filter out Spanish/Portuguese conversational filler
+- Multilingual triggers: "import X" / "importar X" / "agregar X" / "añadir X" → `import_file`
+- Play triggers: "play" / "preview" / "reproducir" / "ver el video" → `play_preview`
+- KEY DISTINCTION: "generate/create a new video" = `generate_video` tool; "edit/compile existing videos" = `video_editor_action`
 
 ---
 
-### Phase 10 — AI Video Generation
+## Feature: Email with Attachments
 
-**`video_gen.js`** — `handleVideoGenerationTool(args, logFn)`
-
-**Prompt construction** (`buildVideoPrompt(params)`):
-Assembles a structured English prompt from 7 fields plus fixed quality boosters:
+### Mandatory 9-Step Flow (enforced by system prompt + hard gate)
 
 ```
-<STYLE_PREFIX> <subject> Setting: <setting>. Characters: <characters>.
-Scene and dialogue: <dialogue_script>. Camera: <camera_style>.
-Color and mood: <mood_color>.
-8-second continuous shot, smooth motion throughout, coherent narrative arc,
-4K ultra-high definition, professional audio if speech is present,
-cinematic composition, no jump cuts, visually compelling framing.
+STEP 1 — Call list_contacts → shows contacts panel
+STEP 2 — Ask: "Who would you like to email?" → get recipient name
+STEP 3 — Ask: "Would you like to include an attachment?"
+         YES → ask type (video/document/image) → list_attachable_files
+               Panel shows files with numbered lookup table
+               User picks → Gemini confirms → remembers exact absPath
+         NO  → proceed to STEP 4
+STEP 4 — Ask: "What would you like the subject to be?" → collect subject
+STEP 5 — Ask: "What would you like to say?" → collect message_intent
+STEP 6 — Call send_email(recipient_name, subject, message_intent, [attachment_path])
+STEP 7 — Read back [EMAIL PREVIEW]: subject, body summary, attachment note
+         Ask: "Does this look good? Say yes to send."
+         YES → send_email(confirmed=true, [all args])
+         Change → re-call send_email with new subject/message_intent (no confirmed_body)
+         Cancel → "Got it, email cancelled."
+STEP 8 — "Email sent!" → open Gmail sent folder
+STEP 9 — Ask: "Send another email, or are you all done?"
 ```
 
-The `STYLE_PREFIXES` map translates the 6 named styles into quality descriptors that consistently improve Veo output.
+**Hard gate at send_email handler:** If `message_intent` is empty on a non-confirmed call → rejected:
 
-**Veo API call** (`callVeoAPI({ fullPrompt, aspectRatio }, apiKey, logFn)`):
+```
+"You skipped required steps. Ask STEP 3 (attachment?), STEP 4 (subject?), STEP 5 (what to say?). Only THEN call send_email."
+```
 
-1. POST to `https://generativelanguage.googleapis.com/v1beta/models/veo-2.0-generate-001:predictLongRunning?key=<key>`
-   - Body: `{ instances: [{ prompt }], parameters: { aspectRatio, durationSeconds: 8, enhancePrompt: true, personGeneration: 'allow_adult' } }`
-2. Extract `opData.name` (long-running operation name)
-3. Poll `GET .../v1beta/<opName>?key=<key>` every 8 seconds, up to 45 attempts (~6 minutes)
-4. On `done: true` → extract `generateVideoResponse.generatedSamples[0].video`
-5. Return video bytes from `bytesBase64Encoded` or by downloading from `uri`
+### Attachable Files (`scanAttachableFiles`)
 
-**Saving and opening:**
+Scans these directories by file type:
 
-- File saved as `Nova_<slug>_<ISO-timestamp>.mp4` in `~/Movies` (macOS) or `~/Videos` (Linux/Windows)
-- `openFolderThenVideo()`: opens the containing folder first (`xdg-open` / `open` / `explorer`), then opens the video in the preferred player (`mpv` → `vlc` → `xdg-open` on Linux; `open` on macOS; `start` on Windows)
+```javascript
+video:    { dirs: [~/Videos, ~/Movies, ~/Downloads] }
+document: { dirs: [~/Documents, ~/Downloads, ~/Desktop] }
+image:    { dirs: [~/Pictures, ~/Desktop, ~/Downloads] }
+```
 
-**Prompt cache** (`~/Nova/video_prompts/`):
+Scans one level of subdirectories (catches `Screenshots/`, `Work/`, etc.). Returns `{ name, absPath }` pairs. Presented as numbered lookup table to Gemini so it passes exact absolute path as `attachment_path`.
 
-- Each generated video saves a JSON record: `{ id, title, prompt_text, full_prompt, created }`
-- `listCachedPrompts()` — reads all `.json` files, sorts by creation date descending
-- `deletePromptFromCache(id)` — removes the file by ID
+### Email Tool Result States
 
-**`live.js` integration:**
+| `result.status`        | Meaning                             | Injection                                    |
+| ---------------------- | ----------------------------------- | -------------------------------------------- |
+| `needs_confirmation`   | Body generated, needs user approval | [EMAIL PREVIEW] injection with confirm args  |
+| `success`              | Email sent                          | Opens Gmail sent folder, asks "another?"     |
+| `draft_saved`          | Saved as draft                      | Spoken naturally                             |
+| `needs_disambiguation` | Multiple contacts with same name    | Numbered list, re-call with `selected_index` |
+| `needs_username`       | Contact not found                   | Ask for email username                       |
+| `needs_domain`         | Have username, need domain          | Ask for domain, assemble full address        |
+| `auth_required`        | Not authenticated                   | Tell user to run `npm run setup-google`      |
 
-- Tool name: `video_generation`, actions: `generate`, `list_prompts`, `delete_prompt`
-- `_videoGenInFlight` mutex prevents parallel Veo submissions
-- `_lastVideoGenAt` + `VIDEO_GEN_DEBOUNCE_MS = 120000` blocks re-triggering during generation
-- After generation completes: `_videoGenInFlight = false`, `_lastVideoGenAt = Date.now()`
+### Email Debounces
+
+```javascript
+_emailInFlight = true / false; // mutex: one flow at a time
+_emailCooldownMs = 8000; // block unconfirmed re-calls within 8s
+_confirmCooldownMs = 6000; // block stale confirmed=true duplicates
+LIST_CONTACTS_COOLDOWN_MS = 30000; // contacts panel already showing
+LIST_ATTACH_COOLDOWN_MS = 20000; // file list already showing
+```
 
 ---
 
-### Common Gotchas
+## Feature: Calendar
 
-- **Wayland breaks transparency.** Always set `ELECTRON_OZONE_PLATFORM_HINT=x11` on Linux before `app.ready`. Do this at the very top of `main.js` before any `require`.
-- **Chromium autoplay policy.** Requires a user gesture to unlock `AudioContext`. The orb click is that gesture — without it, neither Vosk nor TTS will work. Wire `app.commandLine.appendSwitch('autoplay-policy', 'no-user-gesture-required')` AND keep the "click orb to activate" first-use flow.
-- **Gemini Live cooldowns are mandatory.** `live.js` uses `lastExecCommandMap`, `_codeAgentDebounce`, and `_calendarDebounce` to prevent looping tool calls from ambient audio. Remove these and Gemini will hammer the same tool in a tight loop.
-- **Google OAuth redirect URI** must be `http://localhost:3141/oauth2callback` in both `.env` and in Google Cloud Console. Port 3141 is hardcoded in `google_auth.js`.
-- **TTS output format.** Gemini TTS returns raw PCM (no WAV header). `tts.js` prepends a 44-byte RIFF/WAV header (`pcmToWav()`). Parameters: 24000 Hz, 1 channel, 16-bit PCM. If you change these, update the header writer constants.
-- **Research paper model.** Always try `gemini-2.5-pro` first (2 attempts with delay), then fall back to `gemini-2.5-flash` on 503 (model overloaded). Pro produces significantly better papers but hits capacity limits. Never skip the retry logic.
-- **Code Agent project types** must be one of the 7 known values: `static_website`, `react`, `api_only`, `fullstack`, `cli`, `extension`, `python`. The generation prompt is deeply specialized per type — other values produce generic output.
-- **`browser.html` DOM map** is injected via `webview.executeJavaScript()`. The webview must be fully loaded (`did-stop-loading` or `dom-ready`) before injecting. Always add a 500 ms debounce on `url-changed` events before triggering DOM extraction to avoid reading mid-navigation DOM.
-- **`global.novaIsResearching` flag** in `main.js` must be checked AND set before the async research pipeline runs. If you rebuild this, check the flag before starting, set it immediately, and clear it in both the `finally` block and after the 10-minute cooldown expires.
-- **OpenShot must be fully quit before editing `.osp` files.** If OpenShot is open when Nova writes to the `.osp`, OpenShot will overwrite it with the old version on exit. `killOpenShot()` must complete (with a 500 ms settle) before any `writeOsp()` call.
-- **`ffprobe` is required for clean imports.** Without it, `getVideoMetadata()` returns fallback values (1280×720, 30s, 24fps), which still works but may show incorrect clip lengths in OpenShot. Install FFmpeg to enable real metadata extraction.
-- **OpenShot `.osp` clip keyframe structure is strict.** Every keyframe curve must use the exact `{ co: { X, Y }, interpolation: 2 }` object format. A missing or malformed curve causes libopenshot to crash the render. Always use `buildClipEntry()` — never write clip JSON by hand.
-- **Veo 2.0 generation takes 2–5 minutes.** The 2-minute `VIDEO_GEN_DEBOUNCE_MS` is intentional — if Gemini Live retries the tool call while generation is in-flight, the mutex (`_videoGenInFlight`) will block it. Never remove the mutex or debounce.
-- **Veo aspect ratio strings must be `'16:9'`, `'9:16'`, or `'1:1'`** — not the human-readable words. `video_gen.js` maps `landscape/portrait/square` to these internally via `aspectMap`.
-- **Video Editor Mode panel window** must be created as a separate `BrowserWindow` with `nodeIntegration: true` to receive IPC events. If you rebuild the panel, set `webPreferences: { nodeIntegration: true, contextIsolation: false }` — otherwise `require('electron')` will fail in the panel renderer.
-- **xdotool window search is fragile on Linux.** The module tries both `--name "OpenShot"` and `--class "openshot"` variants. If neither matches (e.g. Flatpak uses a different window title), keystrokes silently do nothing. Always surface the `needs_xdotool` / `guide` action so the user knows automation requires xdotool.
+### Actions
+
+| Action               | Trigger Examples                                    |
+| -------------------- | --------------------------------------------------- |
+| `get_events`         | "what's on my calendar", "what do I have this week" |
+| `create_event`       | "schedule a call with Bryan on Monday at 10am"      |
+| `delete_event`       | "cancel my 4pm today"                               |
+| `check_availability` | "am I free Friday afternoon"                        |
+
+Default `time_expression` for `get_events`: `"this week"` (not "today").
+
+**Debounce:** 12 seconds per action key. Prevents Gemini looping calendar calls.
+
+---
+
+## Feature: Code Agent
+
+### Actions
+
+```javascript
+CODE_AGENT_DEBOUNCE_MS = {
+  generate_code: 120000, // 30-60s generation
+  modify_code: 60000, // ~20s modification
+  create_project: 15000,
+  open_project: 10000,
+  list_projects: 10000,
+  preview_project: 10000,
+  start_session: 10000,
+  end_session: 10000,
+};
+```
+
+`generate_code` creates a full project from description. `modify_code` changes specific parts of an existing project. `preview_project` opens in Nova's built-in browser.
+
+---
+
+## Feature: AI Image Generation
+
+### Tool: `generate_image` (Imagen 3)
+
+Saves to `~/Desktop`.
+
+**Two modes:**
+
+- **Single:** One image from full prompt
+- **Batch:** Multiple subjects sharing same style (max 6)
+
+**Required collection before calling:**
+
+1. Style
+2. Mood (only if not obvious)
+3. Orientation (square/landscape/portrait)
+
+**Debounce:** 30s single, 90s batch.
+
+### Batch example
+
+```javascript
+generate_image({
+  prompt: "professional portrait, studio lighting, clean background",
+  subjects: [
+    "a university student",
+    "a software developer",
+    "a nurse in scrubs",
+  ],
+  style: "realistic",
+  aspect_ratio: "portrait",
+});
+// Generates 3 separate images, one per subject
+```
+
+---
+
+## Feature: AI Video Generation
+
+### Tool: `generate_video` (Veo 2)
+
+8-second cinematic AI video with speech and audio. Saves to `~/Videos`.
+
+**Mandatory 8-question collection (one at a time, in order):**
+
+1. Main topic/story
+2. Visual style (cinematic/animated/documentary/nature/sci-fi/commercial)
+3. Environment + location + time of day
+4. Characters (appearance + personality)
+5. Scene breakdown: second-by-second events + exact dialogue
+6. Camera movement (zoom/drone/close-up/wide/handheld/slow-mo)
+7. Color palette and mood
+8. Aspect ratio (16:9/9:16/1:1)
+
+**Debounce:** 120 seconds. Mutex flag `_videoGenInFlight` also blocks concurrent calls. Video takes 2–5 minutes.
+
+---
+
+## Feature: Browser Control
+
+### Tool: `control_browser`
+
+Opens Nova's own `BrowserWindow` (not the system browser).
+
+| Action             | Trigger                                                              |
+| ------------------ | -------------------------------------------------------------------- |
+| `open`             | "search for X on Google", "go to website X", "open X in the browser" |
+| `search_youtube`   | "play X on YouTube", "search YouTube for X"                          |
+| `smart_click`      | "click on X", "click X" — clicks element by visible text             |
+| `scroll`           | "scroll down/up"                                                     |
+| `close`            | "close the browser" — only after user explicitly says "close"        |
+| `toggle_incognito` | "switch to incognito", "exit incognito"                              |
+
+### Store Assistant Mode
+
+Activates on Apple, Amazon, and other stores. Auto-scans DOM after each navigation, narrates products/prices/options. Stuck-URL detection: 3 consecutive same-URL auto-scans → direct-navigation fallback with hardcoded Apple/Amazon URL patterns.
+
+### get_browser_state
+
+Only called when user asks "what's on screen" or "list the elements". Never before smart_click.
+
+**Debounce:** 8s for get_browser_state. 10s post-close lockout.
+
+---
+
+## Feature: Notes
+
+### Tool: `notes_action`
+
+Stored as `.md` in `~/Documents/Nova Notes/`.
+
+```javascript
+NOTES_DEBOUNCE_MS = {
+  create_note: 60000, // AI generation 15-30s
+  update_note: 20000, // AI update ~10s
+  search_notes: 4000,
+  list_notes: 4000,
+  open_note: 2000,
+  exit_notes_mode: 4000,
+};
+```
+
+---
+
+## Feature: Research Paper Generation
+
+### Tool: `create_research_paper`
+
+Full APA-format academic paper via Gemini text API. Opens in browser. Takes several minutes.
+
+**Extremely strict trigger — ALL of these must be true:**
+
+1. Explicit creation verb: write/create/generate/make/build/compose/prepare
+2. Exact phrase: "research paper"/"academic paper"/"scientific paper"/"research essay"
+3. Specific topic named
+
+"Open the research paper" → file-open request, NOT a trigger. "Show me the research paper" → file-open. When in doubt, answer conversationally.
+
+---
+
+## Feature: Stock Charts
+
+### Tool: `show_stock_chart`
+
+Shows chart panel. Narrates: current price, daily change, 3-month trend. **Never opens browser for stock questions.**
+
+Common tickers in system prompt: Apple=AAPL, Microsoft=MSFT, Tesla=TSLA, Amazon=AMZN, Google=GOOGL, Meta=META, Netflix=NFLX, Nvidia=NVDA, Nintendo=NTDOY, Sony=SONY.
+
+---
+
+## Feature: Macro Recording
+
+### Tool: `macro_control`
+
+Records and replays sequences of Nova actions.
+
+- `start_recording` — enters recording mode
+- `stop_recording` — ends, asks for name
+- `run_macro` — replays saved macro
+- `list_macros` — lists saved macros
+- `delete_macro` — removes a macro
+
+**Cannot record:** `send_email` or calendar mutations (would execute on every replay). System prompt warns Gemini about this.
+
+---
+
+## Feature: Screen Analysis
+
+### Tool: `analyze_screen`
+
+Screenshot → Gemini Vision → narrated description. Triggers: "what's on my screen?", "what am I looking at?".
+
+**Debounce:** 5 seconds.
+
+---
+
+## Debounce Architecture
+
+### Summary Table
+
+| Location        | Map Name               | Key Format                    | Purpose                        |
+| --------------- | ---------------------- | ----------------------------- | ------------------------------ |
+| live.js         | `_videoEditorDebounce` | `action` or `action:filename` | API-layer gate, long windows   |
+| live.js         | `_calendarDebounce`    | `action`                      | Calendar loop prevention       |
+| live.js         | `_codeAgentDebounce`   | `action`                      | Code agent long-running gate   |
+| live.js         | `_notesDebounce`       | `action`                      | Notes operation gate           |
+| live.js         | `_macroDebounce`       | `action`                      | Macro operation gate           |
+| live.js         | `_screenDebounce`      | `'screen_analyze'`            | Screen analysis rate limit     |
+| video_editor.js | `_veDebounce`          | `action` or `action:filename` | Tool-level race condition gate |
+
+### Why Two Layers for Video Editor
+
+The live.js layer has long windows (15–30s) to handle echo and Gemini retry behavior. The video_editor.js tool-level layer has short windows (3–12s) to prevent concurrent calls for the same file from running the tool twice. Both must use per-filename keys — if either uses just `action` as the key, different files will block each other.
+
+---
+
+## UI: The Orb & Motion Engine
+
+### Three.js Orb
+
+A 3D sphere with CSS state classes: `listening`, `speaking`, `thinking`. Set by `setOrbState()` in renderer.js.
+
+### Motion Engine (main.js)
+
+Nova wanders during conversation via lerp-based position updates (30ms interval):
+
+| Mode        | Lerp speed | Target change | Screen range |
+| ----------- | ---------- | ------------- | ------------ |
+| `speaking`  | 0.012      | every 5000ms  | 42%W × 38%H  |
+| `listening` | 0.018      | every 3500ms  | 65%W × 58%H  |
+| `thinking`  | 0.022      | every 2200ms  | 55%W × 50%H  |
+
+Home position: bottom-right corner. Nova drifts toward upper-center area while active, returns home when task completes. Drag pauses bounce; bounce resumes from new position after drag.
+
+### Editor Beep System (renderer.js)
+
+Independent audio feedback via Web AudioContext (no Gemini TTS needed):
+
+```javascript
+function _playEditorBeep(type) {
+  const ctx = new AudioContext();
+  const osc = ctx.createOscillator();
+  // 'done':  660Hz → 880Hz ramp (file added)
+  // 'ready': 523Hz → 659Hz ramp (editor opened)
+  // 'error': 200Hz flat (something failed)
+  // Duration: 300ms, gain: 0.3
+}
+ipcRenderer.on("play-editor-beep", (_e, type) => _playEditorBeep(type));
+```
+
+### IPC Channel Reference
+
+| Channel                  | Direction | Purpose                             |
+| ------------------------ | --------- | ----------------------------------- |
+| `drag-start/move/end`    | R→M       | Widget drag                         |
+| `open-chat`              | R→M       | Double-click opens chat             |
+| `audio-chunk`            | R→M       | PCM mic audio                       |
+| `live-audio-chunk`       | M→R       | Gemini TTS audio                    |
+| `show-status-message`    | M→R       | Status badge text                   |
+| `play-editor-beep`       | M→R       | Audio beep ('done'/'ready'/'error') |
+| `video-editor-ready-cue` | M→R       | Status cue text + mic icon flash    |
+| `motion-mode`            | M→R       | Wander mode update                  |
+
+---
+
+## Known Failure Modes & Fixes
+
+### 1. Nova goes silent after opening the video editor
+
+**Cause A:** ACK had "wait silently" → Gemini obeyed and stayed mute.
+**Fix:** ACK now says "Listen — if user says that name is wrong, acknowledge but don't call open_editor again."
+
+**Cause B:** `isProcessingCommand = true` in `show-status-message` handler blocked `speak()` and `askNova()`.
+**Fix:** Removed the flag from that handler.
+
+### 2. Same file imported multiple times (duplicates)
+
+**Cause:** Import debounce expired; Gemini mapped another utterance to same filename.
+**Fix 1:** Per-filename debounce key.
+**Fix 2:** Hard duplicate detection in `addClipToOspTimeline` — checks `file_id` against existing clips before adding.
+
+### 3. Gemini calls `import_file("League1")` when user says "League 2"
+
+**Cause:** CLIP_ADDED injection said "Do NOT add League1.mp4 again" → Gemini read "League1.mp4" → latched onto it.
+**Fix 1:** CLIP_ADDED injection never names the just-added file. Only names remaining files.
+**Fix 2:** When debounce fires for a file already added and only 1 remains, auto-redirect: `"Say: 'Let me add League2.mp4 for you!' Then IMMEDIATELY call import_file(file_name='League2.mp4')."`
+
+### 4. `add_to_timeline(League2)` blocked when called concurrently with League1
+
+**Cause:** Tool-level `_veDebounce` used `action` as key. League1 set `add_to_timeline` debounce; League2 hit it 1ms later → returned `status: 'debounced'`.
+**Fix:** Tool-level debounce also uses per-filename key: `add_to_timeline:league2`.
+
+### 5. Nova goes silent after `add_to_timeline` success
+
+**Cause A:** `prompt = result.status === 'ok' ? null : ...` → no injection for success. Gemini had nothing to act on.
+**Fix:** Add success injection with remaining files, same pattern as import_file.
+
+**Cause B:** ACK pre-confirmed "Done! That clip is on your timeline" before tool ran. If tool then returned an error, contradicting messages → silence.
+**Fix:** ACK now says "Adding X, one moment!" (neutral). Success/error both handled in post-completion injection.
+
+### 6. `delete_clip` contradicts itself
+
+**Cause:** ACK said "Done! It's been removed." before tool confirmed. Second delete of same clip → tool returned error. Two conflicting signals → silence.
+**Fix:** ACK changed to "Removing X from the timeline, one moment!" Both success and error get post-completion injections.
+
+### 7. `play_preview` — "Could not find video files"
+
+**Cause A:** OpenShot saved `.osp` with relative paths. `fs.existsSync('./video.mp4')` failed (wrong CWD).
+**Fix:** `path.resolve(ospDir, rawPath)` where `ospDir = path.dirname(_currentProjectPath)`.
+
+**Cause B:** OpenShot converted `has_audio: true` (boolean) to keyframe object. `f.has_audio === true` → `false`.
+**Fix:** `_hasAudioEnabled()` handles both boolean and `{Points: [{co: {X, Y}}]}` formats.
+
+**Cause C:** Clips on wrong layer after OpenShot reorganized.
+**Fix:** If no clips on layer 5000000, fall back to rendering all clips.
+
+### 8. Project named "piensas" (Spanish filler word)
+
+**Cause:** User said "piensas tú" (you think) in Spanish; Gemini extracted "piensas" as the project name.
+**Fix:** System prompt tells Gemini to filter out conversational filler words in any language and ask again if the name sounds like conversation.
+
+### 9. Email skips attachment/subject/content steps
+
+**Cause:** Gemini called `send_email` directly without following mandatory collection steps.
+**Fix:** Hard gate: empty `message_intent` on non-confirmed call → rejected with step-by-step redirect back to STEP 3.
+
+### 10. Gemini calls `open_editor` instead of `import_file` after editor opens
+
+**Cause:** Without file list in context, Gemini confused "League" with project name "League of Legends".
+**Fix:** FILE_IMPORT_MODE injection includes actual file list from `scanVideoFiles()`.
+
+**open_editor debounce redirect:** If debounced call has a video filename as `file_name`:
+
+```
+EDITOR IS ALREADY OPEN. The user wants to ADD "[filename]". Call import_file(file_name='[filename]') RIGHT NOW.
+```
+
+### 11. `import_file` debounce blocks different files
+
+**Old:** Key = `"import_file"`. After League1, League2 blocked for 30s.
+**Fix:** Keys = `"import_file:league1"` and `"import_file:league2"` independently.
+
+### 12. Debounce fires but Gemini silent
+
+**Cause:** Debounce response message was `"already_running"` with no `Say:` instruction.
+**Fix:** Every debounce response includes explicit speech instruction. For video file repeats with 1 remaining: auto-redirect to next file. For play_preview: "Still rendering, please wait!"
+
+---
+
+## Platform Notes
+
+### Linux (Primary — fully tested)
+
+- Run with `--ozone-platform=x11`
+- xdotool required: `sudo pacman -S xdotool` or `sudo apt install xdotool`
+- OpenShot via Flatpak: `flatpak install flathub org.openshot.OpenShot`
+- Videos folder: `~/Videos`
+- Open video file: `xdg-open 'path/to/file.mp4'`
+- Kill OpenShot: `flatpak kill org.openshot.OpenShot 2>/dev/null; pkill -f openshot-qt`
+- `BrowserWindow` type hint: `'toolbar'` (keeps above desktop without stealing focus)
+
+### macOS (Stubbed, not fully tested)
+
+- Remove `--ozone-platform=x11` from start script
+- No `BrowserWindow` type hint (conditional in main.js: Linux-only)
+- OpenShot: `open -a "OpenShot Video Editor" /path/to/project.osp`
+- Videos folder: `~/Movies`
+- Open video file: `open 'path/to/file.mp4'`
+- Kill OpenShot: `osascript -e 'tell application "OpenShot Video Editor" to quit'`
+- xdotool unavailable → window automation disabled; `canAutomate = false`
+
+### Windows (Stubbed, not fully tested)
+
+- Remove `--ozone-platform=x11` from start script
+- OpenShot: `C:\Program Files\OpenShot Video Editor\openshot-qt.exe`
+- Videos folder: `%USERPROFILE%\Videos` (`os.homedir() + '/Videos'` works correctly)
+- Open video file: `start "" "path\to\file.mp4"`
+- Kill OpenShot: `taskkill /IM openshot-qt.exe /F`
+- xdotool unavailable → window automation disabled
+
+---
+
+## Quick Debug Checklist
+
+**Nova goes silent after an action:**
+
+1. Check if ACK message has "wait silently" → remove it
+2. Check if `prompt = null` for success case → add a success injection
+3. Check if ACK pre-confirms before tool result → make ACK neutral ("one moment!")
+4. Check if `isProcessingCommand` is being set anywhere that blocks speak → remove it
+
+**Gemini loops the same function call:**
+
+1. Check if debounce key is per-action instead of per-filename → fix to `action:filename`
+2. Check if both live.js AND video_editor.js debounce use per-filename keys
+3. Check if the debounce response includes a speak instruction and next-step guidance
+
+**`play_preview` — "no clips" or "could not find files":**
+
+1. Check console `🎬 play_preview:` logs for clip count, layers, and file paths
+2. If paths show as relative: relative-path resolution is needed (ospDir + resolve)
+3. If has_audio is an object: `_hasAudioEnabled()` must be used
+4. If layer != 5000000: layer fallback should activate
+
+**Import works but then goes silent (stops responding):**
+
+1. CLIP_ADDED injection mentions the just-added filename → remove it
+2. CLIP_ADDED missing from success path (`prompt = null`) → add injection
+3. Injection delay is 0ms → set to 1500ms for file operations
+
+**Email steps being skipped:**
+
+1. Verify hard gate is in place at send_email handler (checks `message_intent`)
+2. Verify system prompt still has STEP 1–9 in order with mandatory sequence markers
+3. Verify STEP 3 (attachment) and STEP 4 (subject) are explicitly numbered
+
+**Project gets wrong name from multilingual speech:**
+
+1. System prompt filler-word filter covers: "piensas", "pienso", "quiero", "maybe", "um"
+2. If new filler words appear in logs, add them to the filter list in the open_editor pre-check in live.js
+3. ACK says the project name aloud so user can hear and correct it immediately
+
+**Concurrent file calls blocking each other:**
+
+1. live.js `veKey` uses per-filename format for `import_file` and `add_to_timeline`
+2. video_editor.js `_deKey` uses per-filename format for `import_file`, `add_to_timeline`, `delete_clip`
+3. If either uses just `action` → different files block each other within the debounce window
